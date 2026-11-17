@@ -30,12 +30,14 @@ const STATE_TONES = {
 const RUN_STATUS_LABELS = {
   running: "执行中",
   blocked: "已阻塞",
+  awaiting_acceptance: "待验收",
   completed: "已完成",
 };
 
 const RUN_STATUS_TONES = {
   running: "is-accent",
   blocked: "is-warn",
+  awaiting_acceptance: "is-warn",
   completed: "is-ok",
 };
 
@@ -66,7 +68,7 @@ const VIEWS = [
   { id: "settings", label: "规则" },
 ];
 
-const DECIDABLE_STATES = new Set([
+const DEVELOP_STATES = new Set([
   "candidate",
   "drafting",
   "awaiting_decision",
@@ -74,7 +76,10 @@ const DECIDABLE_STATES = new Set([
   "blocked",
 ]);
 
-const EDITABLE_DRAFT_STATES = DECIDABLE_STATES;
+// 已确认开发进入 ready 后不能再重复确认，但允许用户暂缓或忽略。
+const DECIDABLE_STATES = new Set([...DEVELOP_STATES, "ready"]);
+
+const EDITABLE_DRAFT_STATES = DEVELOP_STATES;
 
 const MERGE_METHODS = [
   { value: "merge", label: "创建合并提交（merge）" },
@@ -1392,11 +1397,19 @@ function renderCandidatesView() {
         "div",
         { class: "empty-state" },
         h("h3", {}, "尚未配置仓库与规则"),
-        h("p", {}, "先在“规则”中添加仓库（owner/repo、本地路径、基准引用），并设置标签、作者、关键词或状态条件。"),
+        h("p", {}, "按以下步骤开始；规则命中只会进入候选池，不等于开发授权。"),
+        h(
+          "ol",
+          { class: "step-list" },
+          h("li", {}, "在“规则”添加仓库（owner/repo、基准引用；本机路径可暂留空）并设置标签、作者、关键词或状态条件。"),
+          h("li", {}, "保存设置后点击顶部“收集 Issue”，从事件中确认各仓库结果。"),
+          h("li", {}, "在需求详情请求只读整理任务稿，核对并保存，处理待决策事项。"),
+          h("li", {}, "确认开发；监督循环自动领取，执行完成后在“验收”记录用户与设计监督结论。"),
+        ),
         h(
           "button",
           { type: "button", class: "btn btn-primary", onclick: () => switchView("settings") },
-          "前往规则配置",
+          "第一步：前往规则配置",
         ),
       ),
     );
@@ -1640,6 +1653,8 @@ function renderCandidateDetail(candidate) {
 
 function renderDraftSection(candidate, draft, entry, editable) {
   const section = h("div", { class: "section" });
+  const activeDrafts = Array.isArray(ui.data?.runtime?.activeDrafts) ? ui.data.runtime.activeDrafts : [];
+  const drafting = candidate.state === "drafting" || activeDrafts.includes(candidate.id);
   section.append(
     h(
       "div",
@@ -1654,8 +1669,19 @@ function renderDraftSection(candidate, draft, entry, editable) {
         : entry?.dirty
           ? badge("未保存内容", "is-warn")
           : badge("尚未生成"),
+      drafting ? badge("整理中", "is-accent") : null,
     ),
   );
+
+  if (drafting) {
+    section.append(
+      h(
+        "p",
+        { class: "hint" },
+        "后端正在只读整理任务稿：不会触发开发，也不会替用户作出决定。完成后刷新状态再核对保存。",
+      ),
+    );
+  }
 
   if (!draft && !(entry && entry.dirty)) {
     section.append(
@@ -2001,7 +2027,9 @@ function developBlockers(candidate, entry) {
   if (!acceptance.length) reasons.push("验收要求为空");
   const pendingDecisions = stringList(candidate.draft?.pendingDecisions);
   if (pendingDecisions.length) reasons.push(`仍有 ${pendingDecisions.length} 项待决策事项`);
-  if (!DECIDABLE_STATES.has(candidate.state)) {
+  if (candidate.state === "ready") {
+    reasons.push("已确认开发并进入就绪队列，不能重复确认；如需暂停可使用暂缓或忽略");
+  } else if (!DEVELOP_STATES.has(candidate.state)) {
     reasons.push(`当前状态“${stateLabel(candidate.state)}”不允许作出开发决定`);
   }
   if (!hasToken()) reasons.push("本地会话令牌不可用");
@@ -2796,6 +2824,7 @@ function renderAcceptanceView() {
               { class: "candidate-topline" },
               h("span", { class: "repo" }, issueRepo(candidate)),
               badge(stateLabel(candidate.state), stateTone(candidate.state)),
+              mergePending(candidate) ? badge("合并待核验", "is-warn") : null,
             ),
             h("span", { class: "candidate-title" }, candidate.issue?.title || "（Issue 无标题）"),
             h(
@@ -2837,6 +2866,7 @@ function renderAcceptanceDetail(candidate) {
           "p",
           { class: "detail-meta" },
           badge(stateLabel(candidate.state), stateTone(candidate.state)),
+          mergePending(candidate) ? badge("合并待核验", "is-warn") : null,
           h("span", { class: "mono" }, candidate.id),
           safeHttpUrl(candidate.issue?.url) ? externalLink(candidate.issue.url, "Issue") : null,
         ),
@@ -3095,6 +3125,21 @@ function renderMergeBox(candidate, pr, reviews) {
   const state = mergeState(candidate, pr, reviews);
   const box = h("div", { class: "merge-box" });
   box.append(h("h4", {}, "合并 PR"));
+  if (mergePending(candidate)) {
+    box.append(
+      h(
+        "div",
+        { class: "form-warn" },
+        h("p", {}, h("strong", {}, "合并结果待核验")),
+        h("p", {}, mergePendingNote(candidate)),
+        h(
+          "p",
+          { class: "hint" },
+          "服务端已持久 pending 状态；刷新页面仍会显示此项，后台只读核对，不会重复发送合并命令。",
+        ),
+      ),
+    );
+  }
   if (!pr) {
     box.append(h("p", { class: "hint" }, "没有 PR 时不能合并。前端不会创建或补写 PR 记录。"));
     return box;
@@ -3136,6 +3181,7 @@ function renderMergeBox(candidate, pr, reviews) {
           id: confirmId,
           type: "checkbox",
           checked: entry.confirmed,
+          disabled: mergePending(candidate) || ui.pending.has(`merge:${candidate.id}`),
           dataset: { mergeConfirm: candidate.id },
           onchange: (event) => {
             entry.confirmed = event.target.checked;
@@ -3151,6 +3197,7 @@ function renderMergeBox(candidate, pr, reviews) {
       ),
       selectControl(MERGE_METHODS, entry.method, {
         id: methodId,
+        disabled: mergePending(candidate) || ui.pending.has(`merge:${candidate.id}`),
         dataset: { focus: methodId },
         onchange: (event) => {
           entry.method = event.target.value;
@@ -3170,7 +3217,11 @@ function renderMergeBox(candidate, pr, reviews) {
           title: state.ready ? "发送合并请求" : state.reasons.join("；"),
           onclick: () => mergeCandidate(candidate),
         },
-        ui.pending.has(`merge:${candidate.id}`) ? "合并中…" : "确认合并",
+        ui.pending.has(`merge:${candidate.id}`)
+          ? "合并中…"
+          : mergePending(candidate)
+            ? "合并待核验"
+            : "确认合并",
       ),
     ),
   );
@@ -3189,6 +3240,21 @@ function renderMergeBox(candidate, pr, reviews) {
   return box;
 }
 
+function mergePending(candidate) {
+  if (!candidate) return false;
+  if (candidate.mergePending === true) return true;
+  const intent = candidate.mergeIntent;
+  return Boolean(
+    intent && typeof intent === "object" && String(intent.status || "").toLowerCase() === "pending",
+  );
+}
+
+function mergePendingNote(candidate) {
+  const intent = candidate && typeof candidate.mergeIntent === "object" ? candidate.mergeIntent : null;
+  const note = intent && typeof intent.note === "string" ? intent.note.trim() : "";
+  return note || "合并请求已提交，后台只通过只读核验确认结果，不会重复发送合并命令。";
+}
+
 function mergeState(candidate, pr, reviews) {
   const checks = [];
   const reasons = [];
@@ -3200,6 +3266,10 @@ function mergeState(candidate, pr, reviews) {
     checks.push({ status, label });
     if (reason) reasons.push(reason);
   };
+
+  if (mergePending(candidate)) {
+    add("pending", "合并结果待核验", "合并结果待核验，不重复发送");
+  }
 
   if (pr) add("done", "存在关联 PR");
   else add("blocked", "关联 PR 缺失", "尚无关联 PR");
@@ -3335,7 +3405,7 @@ function renderSettingsView() {
     h(
       "p",
       { class: "hint" },
-      "每个仓库需要 owner/repo、本机路径与基准引用。可添加多个仓库；全部清空时不会收集任何 Issue。",
+      "每个仓库需要 owner/repo 与基准引用；本机路径可留空用于仅收集需求，开发前需补齐。可添加多个仓库；全部清空时不会收集任何 Issue。",
     ),
   );
   const repoEditor = h("div", { class: "repo-editor" });
@@ -3553,12 +3623,12 @@ function renderRepoRow(repository, index) {
         }),
       ),
       fieldWrap(
-        "本地路径",
+        "本地路径（可留空）",
         h("input", {
           id: pathId,
           type: "text",
           value: repository.localPath,
-          placeholder: "/path/to/repository",
+          placeholder: "/path/to/repository（可留空）",
           dataset: { focus: pathId },
           oninput: (event) => {
             repository.localPath = event.target.value;
@@ -3648,7 +3718,7 @@ function buildSettingsPayload(state) {
     const baseRef = str(row.baseRef).trim() || "HEAD";
     if (!repo && !localPath && !str(row.baseRef).trim()) return;
     if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) errors.push(`第 ${index + 1} 行仓库需为 owner/repo。`);
-    if (!localPath) errors.push(`第 ${index + 1} 行需要本地路径。`);
+    // 本地路径允许留空：仅收集 Issue；后续开发时由 Runtime 再检查。
     const key = repo.toLowerCase();
     if (repo && seen.has(key)) errors.push(`仓库重复：${repo}。`);
     if (repo) seen.add(key);
@@ -3868,6 +3938,11 @@ async function mergeCandidate(candidate) {
   const entry = acceptanceEntry(candidate);
   const pr = candidate.latestResult?.pr;
   const key = `merge:${candidate.id}`;
+  if (mergePending(candidate)) {
+    ui.errors.set(key, `合并结果待核验：${mergePendingNote(candidate)} 不会重复发送合并命令。`);
+    render();
+    return;
+  }
   if (!pr) {
     ui.errors.set(key, "没有关联 PR，不能合并。");
     render();
@@ -3891,9 +3966,27 @@ async function mergeCandidate(candidate) {
       body: { expectedHeadSha: pr.headSha, confirmed: true, method: entry.method },
     });
     entry.confirmed = false;
+    if (response?.merged === true && response.mergeSha) {
+      setNotice("ok", `合并完成，merge commit：${response.mergeSha}`);
+      return;
+    }
+    if (response?.merged === true && !response.mergeSha) {
+      setNotice(
+        "warn",
+        "服务端返回 merged=true 但未提供完整 merge SHA，结果未确认；请核对 PR 实际状态，不会重复发送合并命令。",
+      );
+      return;
+    }
+    if (response?.pending === true) {
+      setNotice(
+        "warn",
+        `合并结果待核验：${str(response.note) || "后台只读核对中"} 刷新后仍会显示服务器持久 pending，不会重复发送。`,
+      );
+      return;
+    }
     setNotice(
-      "ok",
-      response?.mergeSha ? `合并完成，merge commit：${response.mergeSha}` : "合并请求已完成。",
+      "warn",
+      `合并未确认：${str(response?.note) || "服务端未返回 merged=true 和 merge SHA"}。请在 PR 核对实际状态，不要重复点击。`,
     );
   });
 }

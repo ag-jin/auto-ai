@@ -57,3 +57,37 @@ node scripts/prepare-task.mjs --input examples/task.json --template templates/de
 另已实现 SQLite 授权/调度核心与前端初版。CLI 当前显式接受模板路径；catalog 自动选择和 HTTP 联调仍在实施。**尚未实现完整的 Issue 监听和自动 Worker 调度。创建 Issue 不会自动开始执行。**
 
 运行设计、状态与恢复约定见 [DESIGN.md](docs/DESIGN.md)。下一步实施范围见 [EXECUTION_ROUTE.md](docs/EXECUTION_ROUTE.md)。
+
+## 本地 HTTP 工作台
+
+后端与接口约定见 [RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md) 与 [HTTP_CONTRACT.md](docs/HTTP_CONTRACT.md)。HTTP 层只调用 Runtime Interface，不直接读数据库或运行清单。
+
+安装依赖（当前仅 `yaml@2.9.1`；Node.js 22+）：
+
+```sh
+npm install
+```
+
+启动工作台（需要已集成 `src/runtime.mjs`；未集成时会明确报错，不会用 mock 替代生产后端）：
+
+```sh
+npm start -- --host 127.0.0.1 --port 4310 --app-repo-dir /path/to/auto-ai
+```
+
+- `--host` 仅允许 loopback，默认 `127.0.0.1`。
+- `--port` 默认 `4310`。
+- `--data-dir` 默认 `<app-repo-dir>/.auto-ai/app`。
+- `--app-repo-dir` 默认当前目录。
+- 启动会输出实际地址、数据目录与应用仓库；`SIGINT`/`SIGTERM` 会关闭 HTTP 与 Runtime。
+
+服务只绑定 loopback，写请求需要同源来源与内存中的 `X-Auto-AI-Token`；令牌来自同源 `GET /api/state`，不通过 CORS 暴露，Worker 不获得工作台令牌。
+
+检查与测试：
+
+```sh
+node --check public/app.js
+node --test test/http-server.test.mjs
+npm test
+```
+
+`test/http-server.test.mjs` 使用注入的 fake Runtime 验证路由、授权、CAS 409、Host/Origin/令牌、非法 JSON、超大请求、路径穿越、符号链接越界、响应脱敏与关闭流程。它覆盖 HTTP 层合同，不等于连接真实 GitHub/Pi 的完整线上验收；真实后端联调与浏览器最终检查需在 Runtime 集成后由主会话完成。

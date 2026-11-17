@@ -1,5 +1,9 @@
 # T007 结果：需求整理方法纳入版本化模板
 
+> 监督返修（2026-11-18）：下方是首轮 Worker 自测记录，尚未最终验收。独立 `npm test` 106/106 通过，但真实 Pi 检查复现启动竞态：draft 记录先写 running，Pi.start 尚在等待进程身份时，tick 先调 status 得到 unknown；实际 Pi 随后 completed，Runtime 却永久不接管。已在 `test/runtime-edges.test.mjs` 加入确定性回归，当前应失败。请在既有 Runtime 范围修复，并实际复跑该测试、全量与真实 Pi 隔离闭环。
+>
+> 首轮本工作树内的 runtime-live 证据已随回收丢失，不能再作为可读取证据引用。返修使用中央目录 `/Users/linguojin/Workspace/auto-ai/github-first/.auto-ai/validation/T007/` 保存检查日志与完整 Pi 记录；可将脚本默认生成的证据复制到中央，不改范围外的检查脚本。请将本文下方状态与路径更新为最终真实结果，区分失败复现和修复后通过。首轮失败现场已保存在中央 `independent-start-race/`。
+
 - run_id：`run-01a73750-61af-414e-9407-d286c7b03af4`
 - attempt：1
 - template_ref：`d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`

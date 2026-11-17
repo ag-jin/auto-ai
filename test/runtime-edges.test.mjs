@@ -75,3 +75,25 @@ test('Runtime 拒绝相对数据路径和模板仓库路径',()=>{
  assert.throws(()=>new Runtime({dataDir:'relative',appRepoDir}),/绝对路径/);
  assert.throws(()=>new Runtime({dataDir:tmpdir(),appRepoDir:'relative'}),/绝对路径/);
 });
+
+test('整理启动尚未完成时 tick 不提前轮询为 unknown，完成后仍接收同一结果',async t=>{
+ const dataDir=await mkdtemp(path.join(tmpdir(),'auto-ai-draft-start-race-'));
+ const wf=new Workflow({dbPath:path.join(dataDir,'workflow.db')});
+ wf.saveSettings({...settings,repositories:[{repo,localPath:dataDir,baseRef:'HEAD'}]});wf.collect([issue]);wf.close();
+ const entered=gate(),release=gate();let starting=true,statusCalls=0,starts=0,drafting;
+ const output={templateId:'development',goal:'fixture',scope:'NOTE.md',acceptance:['read NOTE.md'],context:'',pendingDecisions:[],writeScopes:['NOTE.md'],dependsOn:[],priority:0};
+ const pi={
+  async start({id}){starts++;entered.release();await release.promise;starting=false;return{id,state:'running',sessionId:'start-race'};},
+  async status(){statusCalls++;return starting?{state:'unknown',error:'monitor identity not recorded yet'}:{state:'completed',output:JSON.stringify(output)};},
+ };
+ const runtime=new Runtime({dataDir,appRepoDir,github:{},pi,workspace:{},tickMs:600000});
+ t.after(async()=>{release.release();await drafting?.catch(()=>{});await runtime.close();await rm(dataDir,{recursive:true,force:true});});
+ await runtime.start();drafting=runtime.requestDraft(id);await entered.promise;
+ await runtime.tick();
+ assert.equal(statusCalls,0,'Pi.start 尚未返回，不能把尚未记录进程身份误判为 unknown');
+ release.release();await drafting;await runtime.tick();
+ const state=await runtime.getState();
+ assert.equal(starts,1,'启动与监督只能使用同一个 Pi 请求');
+ assert.equal(state.candidates.find(c=>c.id===id).draft.goal,'fixture');
+ assert.equal(state.runs.length,0,'接收整理结果仍不能自动批准开发');
+});

@@ -10,5 +10,8 @@
   "scripts": {
     "test": "node --test",
     "check:trial": "node scripts/check-t001.mjs"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
   }
 }

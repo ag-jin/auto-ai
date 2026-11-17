@@ -35,10 +35,15 @@ const AUTO_DRAFT_SKIP_STATES = new Set([
 // the user explicitly asks again.
 const AUTO_DRAFT_BLOCKING_STATES = new Set(['failed', 'unknown']);
 // Draft records that own a Pi request or the start window leading to one.
-const DRAFT_PENDING_STATES = new Set(['starting', 'running']);
+// `unconfirmed` means the Pi request exists but its monitor identity or result
+// is not readable yet: the draft keeps ownership of that task id, so no second
+// model call may be started for it.
+const DRAFT_PENDING_STATES = new Set(['starting', 'running', 'unconfirmed']);
 // Only a draft whose Pi.start has returned owns a pollable monitor identity;
 // polling during `starting` would report a false `unknown`.
-const DRAFT_POLLABLE_STATES = new Set(['running']);
+// An `unconfirmed` record keeps being polled read-only until its task reports a
+// final result.
+const DRAFT_POLLABLE_STATES = new Set(['running', 'unconfirmed']);
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
@@ -511,6 +516,10 @@ export class Runtime {
       const draftRecord = this.#readDraftRecord(candidate.id);
       if (draftRecord && ['failed', 'unknown'].includes(draftRecord.state)) {
         blockedReason = `只读整理未完成：${draftRecord.error ?? draftRecord.state}`;
+      } else if (draftRecord && draftRecord.state === 'unconfirmed') {
+        blockedReason =
+          '只读整理状态暂未确认，保持同一任务的只读核对且不重复调用模型：' +
+          (draftRecord.error ?? 'unknown');
       }
     }
     return {
@@ -1556,7 +1565,35 @@ export class Runtime {
         continue;
       }
 
-      if (status.state === 'running') {
+      if (status.state === 'running' || status.state === 'unknown') {
+        if (status.state === 'unknown') {
+          // The Pi request still exists but its monitor identity/result is not
+          // readable yet. This is a transient hold, never a terminal failure and
+          // never a reason to start a second model call for the same draft.
+          if (record.state !== 'unconfirmed') {
+            record.state = 'unconfirmed';
+            record.unconfirmedAt = now();
+            record.error = status.error ?? '整理任务状态暂未确认';
+            writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
+            workflow.recordEvent({
+              kind: 'draft.unconfirmed',
+              message: `候选 ${record.candidateId} 的只读整理状态暂未确认，保留同一任务继续只读核对：${record.error}`,
+              candidateId: record.candidateId,
+              data: { taskId: record.taskId },
+            });
+          }
+        } else if (record.state === 'unconfirmed') {
+          // The previously unreadable task is now confirmed running again.
+          record.state = 'running';
+          record.error = null;
+          writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
+          workflow.recordEvent({
+            kind: 'draft.confirmed',
+            message: `候选 ${record.candidateId} 的只读整理恢复为运行中（${record.taskId}）`,
+            candidateId: record.candidateId,
+            data: { taskId: record.taskId },
+          });
+        }
         this.#drafts.set(record.candidateId, {
           taskId: record.taskId,
           sourceRev: record.sourceRev,
@@ -1754,7 +1791,9 @@ export class Runtime {
       });
       return;
     }
-    record.state = 'running';
+    // A request that exists but whose monitor identity is not confirmed yet is
+    // adopted read-only as `unconfirmed`; it keeps polling the same task id.
+    record.state = status?.state === 'unknown' ? 'unconfirmed' : 'running';
     writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
     this.#drafts.set(record.candidateId, {
       taskId: record.taskId,

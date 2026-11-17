@@ -2134,6 +2134,51 @@ test('Pi.start 返回后暂时 unknown 时显式整理不重复启动且仍接�
   assert.equal(state.runs.length, 0, '接管不会授权开发');
 });
 
+test('整理进程状态暂未确认时保留同一 taskId 与只读核对，确认恢复后仍应用原结果', async (t) => {
+  const { runtime, github, pi, dataDir } = await makeRuntime(t, { tickMs: 600000 });
+  t.after(() => runtime.close());
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+  const call = pi.startCalls[0];
+  pi.markUnknown(call.id, 'request 已落盘，process/result 暂未落盘');
+  await runtime.tick();
+
+  const file = draftRecordPath(dataDir, candidateId(1));
+  let record = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(record.state, 'unconfirmed', '暂不可读的整理任务保留为未确认而非终止失败');
+  assert.equal(record.taskId, call.id);
+  let state = await runtime.getState();
+  assert.ok(state.runtime.activeDrafts.includes(candidateId(1)));
+  assert.match(
+    state.candidates.find((c) => c.id === candidateId(1)).blockedReason ?? '',
+    /暂未确认/,
+  );
+  assert.ok(state.events.some((event) => event.kind === 'draft.unconfirmed'));
+
+  // 未确认期间自动收集与显式整理都不能新建模型任务。
+  await runtime.collect();
+  await runtime.tick();
+  await runtime.requestDraft(candidateId(1));
+  assert.equal(pi.startCalls.length, 1, '未确认的旧任务仍占用同一 taskId，不得重复调用模型');
+
+  // 现场恢复为运行中后只记录确认事件，不换 taskId。
+  pi.tasks.get(call.id).state = 'running';
+  await runtime.tick();
+  record = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(record.state, 'running');
+  state = await runtime.getState();
+  assert.ok(state.events.some((event) => event.kind === 'draft.confirmed'));
+
+  pi.complete(call.id, draftOutput({ goal: '确认恢复后的原结果' }));
+  await runtime.tick();
+  state = await runtime.getState();
+  assert.equal(state.candidates.find((c) => c.id === candidateId(1)).draft.goal, '确认恢复后的原结果');
+  assert.equal(state.runs.length, 0, '恢复后的整理结果仍不授权开发');
+  assert.equal(pi.startCalls.length, 1);
+});
+
 test('全局仅一个槽位时，准备失败释放占用并继续安排另一仓库', async (t) => {
   const { runtime, github, pi, workspace } = await makeRuntime(t, { tickMs: 60000 });
   try {

@@ -21,6 +21,19 @@ import { WorkspaceAdapter } from './workspace-adapter.mjs';
 
 const MERGE_METHODS = new Set(['merge', 'squash', 'rebase']);
 const EVIDENCE_STATUSES = new Set(['passed', 'failed', 'not_run']);
+// A candidate in these states already carries a user decision or an accepted
+// development, so automatic collection must never start a fresh draft for it.
+const AUTO_DRAFT_SKIP_STATES = new Set([
+  'deferred',
+  'ignored',
+  'ready',
+  'running',
+  'awaiting_acceptance',
+  'completed',
+]);
+// A failed or unknown draft for the same source revision is only retried when
+// the user explicitly asks again.
+const AUTO_DRAFT_BLOCKING_STATES = new Set(['failed', 'unknown']);
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
@@ -31,6 +44,21 @@ function isObject(value) {
 
 function now() {
   return new Date().toISOString();
+}
+
+function decisionFingerprint(decision) {
+  if (decision === null || decision === undefined) {
+    return null;
+  }
+  if (!isObject(decision)) {
+    return JSON.stringify(decision);
+  }
+  return JSON.stringify([
+    decision.action ?? null,
+    decision.draftRev ?? null,
+    decision.actor ?? null,
+    decision.at ?? null,
+  ]);
 }
 
 function sha256(text) {
@@ -559,10 +587,23 @@ export class Runtime {
 
     for (const candidate of workflow.listCandidates({ includeExcluded: false })) {
       if (this.#closing) break;
-      if (candidate.draft || candidate.activeRunId) {
+      if (candidate.draft || candidate.activeRunId || candidate.decision) {
+        continue;
+      }
+      if (AUTO_DRAFT_SKIP_STATES.has(candidate.state)) {
         continue;
       }
       if (this.#drafts.has(candidate.id)) {
+        continue;
+      }
+      const previous = this.#readDraftRecord(candidate.id);
+      if (
+        previous &&
+        previous.sourceRev === candidate.sourceRev &&
+        AUTO_DRAFT_BLOCKING_STATES.has(previous.state)
+      ) {
+        // Same source revision already failed/unknown; only an explicit
+        // requestDraft may call the model again.
         continue;
       }
       try {
@@ -603,6 +644,9 @@ export class Runtime {
         attempts,
         sourceRev: candidate.sourceRev,
         draftRev: candidate.draft ? candidate.draft.rev : null,
+        // Persist the user intent this draft is based on. Any later decision
+        // wins over this asynchronously produced result.
+        decisionSnapshot: decisionFingerprint(candidate.decision),
         state: 'running',
         startedAt: now(),
         endedAt: null,
@@ -1515,30 +1559,48 @@ export class Runtime {
 
     const currentDraftRev = candidate.draft ? candidate.draft.rev : null;
     if (candidate.sourceRev !== record.sourceRev) {
-      record.state = 'stale';
-      record.endedAt = now();
-      record.error = 'Issue 源内容已变化，丢弃旧整理结果';
-      writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
-      this.#drafts.delete(record.candidateId);
-      workflow.recordEvent({
-        kind: 'draft.discarded',
+      this.#discardDraftResult(record, {
+        state: 'stale',
+        error: 'Issue 源内容已变化，丢弃旧整理结果',
         message: `候选 ${record.candidateId} 的整理结果因 sourceRev 变化被丢弃`,
-        candidateId: record.candidateId,
-        repo: candidate.issue.repo,
+        candidate,
+        result: parsed,
       });
       return;
     }
     if (currentDraftRev !== record.draftRev) {
-      record.state = 'stale';
-      record.endedAt = now();
-      record.error = '任务稿已被手工修改，丢弃旧整理结果';
-      writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
-      this.#drafts.delete(record.candidateId);
-      workflow.recordEvent({
-        kind: 'draft.discarded',
+      this.#discardDraftResult(record, {
+        state: 'stale',
+        error: '任务稿已被手工修改，丢弃旧整理结果',
         message: `候选 ${record.candidateId} 的整理结果因任务稿 CAS 变化被丢弃`,
-        candidateId: record.candidateId,
-        repo: candidate.issue.repo,
+        candidate,
+        result: parsed,
+      });
+      return;
+    }
+
+    // A user decision made after this draft started always wins. The old
+    // result is kept as evidence but never applied, so it cannot clear a
+    // defer/ignore choice or an already granted development authorization.
+    const currentDecision = decisionFingerprint(candidate.decision);
+    if (!Object.prototype.hasOwnProperty.call(record, 'decisionSnapshot')) {
+      if (candidate.decision !== null) {
+        this.#discardDraftResult(record, {
+          state: 'discarded',
+          error: '整理记录缺少决定快照，保留当前用户决定',
+          message: `候选 ${record.candidateId} 的整理结果因缺少决定快照被保守丢弃`,
+          candidate,
+          result: parsed,
+        });
+        return;
+      }
+    } else if (record.decisionSnapshot !== currentDecision) {
+      this.#discardDraftResult(record, {
+        state: 'discarded',
+        error: '用户在整理开始后更新了决定，保留用户决定',
+        message: `候选 ${record.candidateId} 的整理结果因用户决定变化被丢弃`,
+        candidate,
+        result: parsed,
       });
       return;
     }
@@ -1571,6 +1633,23 @@ export class Runtime {
         repo: candidate.issue.repo,
       });
     }
+  }
+
+  #discardDraftResult(record, { state, error, message, candidate, result }) {
+    record.state = state;
+    record.endedAt = now();
+    record.error = error;
+    // Evidence only: the parsed result is preserved on disk but not applied.
+    record.discarded = { reason: error, at: record.endedAt, result };
+    writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
+    this.#drafts.delete(record.candidateId);
+    this.#wf.recordEvent({
+      kind: 'draft.discarded',
+      message,
+      candidateId: record.candidateId,
+      repo: candidate?.issue?.repo,
+      data: { state, reason: error },
+    });
   }
 
   async #recoverDrafts() {

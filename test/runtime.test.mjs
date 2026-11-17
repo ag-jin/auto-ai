@@ -563,19 +563,19 @@ test('无稿 defer/ignore、develop 严格校验、保存改变清授权、CAS �
   const { runtime, github, pi } = await makeRuntime(t);
   await configure(runtime);
   await runtime.start();
-  github.setIssues(REPO, [issue(1), issue(2)]);
+  github.setIssues(REPO, [issue(1), issue(2), issue(3)]);
   await runtime.collect();
 
-  const deferState = await runtime.decide(candidateId(1), { action: 'defer' });
+  const deferState = await runtime.decide(candidateId(2), { action: 'defer' });
   assert.equal(deferState.state, 'deferred');
   assert.equal(deferState.decision.action, 'defer');
-  const ignoreState = await runtime.decide(candidateId(2), { action: 'ignore' });
+  const ignoreState = await runtime.decide(candidateId(3), { action: 'ignore' });
   assert.equal(ignoreState.state, 'ignored');
   assert.equal(ignoreState.decision.draftRev, null);
 
   // Develop requires an explicit current revision.
   await assert.rejects(
-    () => runtime.decide(candidateId(1), { action: 'develop' }),
+    () => runtime.decide(candidateId(2), { action: 'develop' }),
     (error) => error.statusCode === 400,
   );
 
@@ -1587,4 +1587,236 @@ test('准备中断后重启继续幂等准备、复用同一工作树，不误�
   );
   assert.equal(pi.startCalls.filter((call) => call.role === 'worker').length, 2);
   await third.close();
+});
+
+// ---------------------------------------------------------------------------
+// 16. Asynchronous drafts must not override user decisions or retry failures
+// ---------------------------------------------------------------------------
+
+function draftRecordPath(dataDir, id) {
+  const key = createHash('sha256').update(id, 'utf8').digest('hex').slice(0, 16);
+  return path.join(dataDir, 'drafts', `${key}.json`);
+}
+
+test('迟到的整理成功不覆盖无稿 defer/ignore，重复收集与重开都不再调用模型', async (t) => {
+  const { runtime, github, pi, workspace, dataDir } = await makeRuntime(t);
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1), issue(2)]);
+  await runtime.collect();
+
+  const draftCalls = () => pi.startCalls.filter((call) => call.role === 'draft');
+  assert.equal(draftCalls().length, 2);
+
+  await runtime.decide(candidateId(1), { action: 'defer' });
+  await runtime.decide(candidateId(2), { action: 'ignore' });
+  pi.complete(draftCalls()[0].id, draftOutput({ goal: '迟到的候选一整理' }));
+  pi.complete(draftCalls()[1].id, draftOutput({ goal: '迟到的候选二整理' }));
+  await runtime.tick();
+
+  let state = await runtime.getState();
+  let first = state.candidates.find((item) => item.id === candidateId(1));
+  let second = state.candidates.find((item) => item.id === candidateId(2));
+  assert.equal(first.state, 'deferred');
+  assert.equal(first.decision.action, 'defer');
+  assert.equal(first.draft, null, '用户决定优先，迟到整理不能保存任务稿');
+  assert.equal(second.state, 'ignored');
+  assert.equal(second.decision.action, 'ignore');
+  assert.equal(second.draft, null);
+  assert.ok(state.events.some((event) => event.kind === 'draft.discarded'));
+  assert.equal(pi.startCalls.filter((call) => call.role === 'worker').length, 0);
+
+  const startsBeforeRepeats = pi.startCalls.length;
+  await runtime.tick();
+  await runtime.collect();
+  await runtime.tick();
+  assert.equal(pi.startCalls.length, startsBeforeRepeats, '重复 tick/收集不能再整理已决定的候选');
+  await runtime.close();
+
+  const restarted = new Runtime({
+    dataDir,
+    appRepoDir: APP_REPO,
+    github,
+    pi,
+    workspace,
+    tickMs: 10,
+  });
+  runtimeDataDir.set(restarted, dataDir);
+  await restarted.start();
+  await restarted.collect();
+  await restarted.tick();
+  state = await restarted.getState();
+  first = state.candidates.find((item) => item.id === candidateId(1));
+  second = state.candidates.find((item) => item.id === candidateId(2));
+  assert.equal(first.state, 'deferred');
+  assert.equal(first.decision.action, 'defer');
+  assert.equal(first.draft, null);
+  assert.equal(second.state, 'ignored');
+  assert.equal(second.decision.action, 'ignore');
+  assert.equal(second.draft, null);
+  assert.equal(pi.startCalls.length, startsBeforeRepeats, '重开后也不能自动重新整理已决定的候选');
+  await restarted.close();
+});
+
+test('整理启动后用户批准已有稿，迟到结果不能清除授权（含已领取与未领取）', async (t) => {
+  const { runtime, github, pi } = await makeRuntime(t);
+  await configure(runtime, { concurrency: { global: 2, perRepo: 1 } });
+  await runtime.start();
+  github.setIssues(REPO, [issue(1), issue(2)]);
+  await runtime.collect();
+
+  const draftCalls = () => pi.startCalls.filter((call) => call.role === 'draft');
+  assert.equal(draftCalls().length, 2);
+  pi.complete(draftCalls()[0].id, draftOutput({ goal: '候选一初稿' }));
+  pi.complete(draftCalls()[1].id, draftOutput({ goal: '候选二初稿' }));
+  await runtime.tick();
+
+  let state = await runtime.getState();
+  const revs = new Map();
+  for (const id of [candidateId(1), candidateId(2)]) {
+    const candidate = state.candidates.find((item) => item.id === id);
+    assert.ok(candidate.draft);
+    revs.set(id, candidate.draft.rev);
+  }
+
+  // Re-drafts start first; the user then approves the existing drafts while
+  // these async drafts are still running.
+  await runtime.requestDraft(candidateId(1));
+  await runtime.requestDraft(candidateId(2));
+  const lateDrafts = draftCalls().slice(2);
+  assert.equal(lateDrafts.length, 2);
+
+  await runtime.decide(candidateId(1), { action: 'develop', draftRev: revs.get(candidateId(1)) });
+  await runtime.decide(candidateId(2), { action: 'develop', draftRev: revs.get(candidateId(2)) });
+  await runtime.tick();
+  state = await runtime.getState();
+  assert.equal(
+    state.candidates.find((item) => item.id === candidateId(1)).state,
+    'running',
+    '候选一已领取',
+  );
+  assert.equal(
+    state.candidates.find((item) => item.id === candidateId(2)).state,
+    'ready',
+    '每仓库上限使候选二未领取',
+  );
+
+  pi.complete(lateDrafts[0].id, draftOutput({ goal: '迟到结果一' }));
+  pi.complete(lateDrafts[1].id, draftOutput({ goal: '迟到结果二' }));
+  await runtime.tick();
+
+  state = await runtime.getState();
+  for (const [index, id] of [candidateId(1), candidateId(2)].entries()) {
+    const candidate = state.candidates.find((item) => item.id === id);
+    assert.equal(candidate.decision.action, 'develop', `${id} 的开发决定不能被迟到整理清除`);
+    assert.ok(candidate.pinnedTemplate, `${id} 应保留固定模板`);
+    assert.equal(candidate.draft.rev, revs.get(id), `${id} 的迟到整理不能替换已批准任务稿`);
+    assert.doesNotMatch(candidate.draft.goal, /迟到结果/);
+    assert.equal(candidate.state, index === 0 ? 'running' : 'ready');
+  }
+  await runtime.close();
+});
+
+test('同源失败/未知整理不自动重试，重开不忘记，显式请求与新源版本各一次', async (t) => {
+  const { runtime, github, pi, workspace, dataDir } = await makeRuntime(t);
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+
+  const draftCalls = () => pi.startCalls.filter((call) => call.role === 'draft');
+  assert.equal(draftCalls().length, 1);
+  pi.fail(draftCalls()[0].id, '模拟整理失败');
+  await runtime.tick();
+  assert.equal(draftCalls().length, 1);
+
+  await runtime.collect();
+  await runtime.tick();
+  await runtime.collect();
+  await runtime.tick();
+  assert.equal(draftCalls().length, 1, '同源失败不能由自动收集重试');
+
+  await runtime.close();
+  const restarted = new Runtime({
+    dataDir,
+    appRepoDir: APP_REPO,
+    github,
+    pi,
+    workspace,
+    tickMs: 10,
+  });
+  runtimeDataDir.set(restarted, dataDir);
+  await restarted.start();
+  await restarted.collect();
+  await restarted.tick();
+  assert.equal(draftCalls().length, 1, '重开 Runtime 也不能忘记同源失败限制');
+
+  await restarted.requestDraft(candidateId(1));
+  assert.equal(draftCalls().length, 2, '显式 requestDraft 恰好新增一次');
+  pi.fail(draftCalls()[1].id, '第二次仍失败');
+  await restarted.tick();
+  await restarted.collect();
+  await restarted.tick();
+  assert.equal(draftCalls().length, 2, '显式重试再次失败后仍不自动重试');
+
+  // A genuinely new source revision is allowed to auto-draft exactly once.
+  github.overrideIssue(REPO, 1, { ...issue(1), body: '新的正文' });
+  await restarted.collect();
+  await restarted.tick();
+  assert.equal(draftCalls().length, 3);
+  await restarted.collect();
+  await restarted.tick();
+  assert.equal(draftCalls().length, 3, '新源版本的自动整理最多一次');
+  pi.complete(draftCalls()[2].id, draftOutput({ goal: '新源版本整理' }));
+  await restarted.tick();
+  const state = await restarted.getState();
+  const candidate = state.candidates.find((item) => item.id === candidateId(1));
+  assert.equal(candidate.draft.goal, '新源版本整理');
+  assert.equal(candidate.decision, null);
+  await restarted.close();
+});
+
+test('旧格式整理记录重开后保守恢复，保留当前用户决定并留存证据', async (t) => {
+  const { runtime, github, pi, workspace, dataDir } = await makeRuntime(t);
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+
+  const draftCall = pi.startCalls.find((call) => call.role === 'draft');
+  assert.ok(draftCall);
+  await runtime.close();
+
+  // Simulate a record written before decision snapshots existed.
+  const recordFile = draftRecordPath(dataDir, candidateId(1));
+  const record = JSON.parse(await readFile(recordFile, 'utf8'));
+  delete record.decisionSnapshot;
+  assert.equal(record.state, 'running');
+  await writeFile(recordFile, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+
+  const restarted = new Runtime({
+    dataDir,
+    appRepoDir: APP_REPO,
+    github,
+    pi,
+    workspace,
+    tickMs: 10,
+  });
+  runtimeDataDir.set(restarted, dataDir);
+  await restarted.start();
+  await restarted.decide(candidateId(1), { action: 'defer' });
+  pi.complete(draftCall.id, draftOutput({ goal: '旧记录迟到结果' }));
+  await restarted.tick();
+
+  const state = await restarted.getState();
+  const candidate = state.candidates.find((item) => item.id === candidateId(1));
+  assert.equal(candidate.state, 'deferred');
+  assert.equal(candidate.decision.action, 'defer');
+  assert.equal(candidate.draft, null, '缺少决定快照的旧记录不能覆盖当前用户决定');
+  assert.ok(state.events.some((event) => event.kind === 'draft.discarded'));
+
+  const saved = JSON.parse(await readFile(recordFile, 'utf8'));
+  assert.equal(saved.state, 'discarded');
+  assert.equal(saved.discarded.result.goal, '旧记录迟到结果', '丢弃的结果保留为证据');
+  await restarted.close();
 });

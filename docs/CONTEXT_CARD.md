@@ -45,4 +45,6 @@ Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录
 
 首轮实际提交 PR #3 并自动回收 Worker 树。独立全量 106/106 通过，但真实 Pi 复核发现启动竞态：tick 在 Pi.start 返回前误判 unknown，实际已完成结果不再接管。已在 PR #3 记录设计 changes_requested，并提交确定性失败回归 `835e638`；失效的工作树内自测证据引用同时要求修正。
 
-现有 Runtime 的 retry 已派发返修 `run-a5500446-44b8-4b27-9238-6b844132e932`，从首轮代码与失败回归 `835e638` 继续，仍沿用原批准稿与模板固定引用。仓库默认基准已恢复为 design/github-first-templates。监督该既有返修、独立验证并核验最终 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准不包括最终用户验收或合并；PR #1 仍待最终验收。
+首轮返修 `run-a5500446-44b8-4b27-9238-6b844132e932` 已交付 PR #4（756235e），树已回收。固定提交的独立全量 108/108、真实 Pi 6/6 通过，但新鲜上下文复现另一恢复缺口：starting 重启或身份等待到期的暂时 unknown 会永久停查；显式请求还会重复派发。已记录设计 changes_requested，提交两个确定性失败回归 `2be87c8`。
+
+现有 Runtime 第二次 retry 正在执行 `run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`，从 `2be87c8` 继续，仍沿用原批准稿与模板固定引用。要求保留原 taskId/promptRef/promptText、只读复查未知任务并接收后续结果，不在旧任务未确认停止时重复派发，同时修正结果文档两处证据表述。仓库默认基准已恢复 design/github-first-templates。监督该既有返修并独立核验最终 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准不包括最终用户验收或合并；PR #1 仍待最终验收。

@@ -41,4 +41,14 @@
 
 当前结论：Standards 1 项证据问题待返修；Spec 无新增确认问题。主会话实际运行另发现上述启动竞态，必须修复后再验收。
 
-Next action：监督已启动的返修 Run，独立复跑并核对新的 PR；用户最终验收与合并仍未授权。
+## 第二次返修：未知状态的后续接管
+
+第一次返修交付真实 PR #4，head `756235e8b00582ff8856f61af5e12e7103b0202c`，对应 Worker 树已回收。主会话固定该提交独立跑 `npm test` 108/108、真实 Pi 闭环 6/6（恰好一次 draft、一次 worker，均实际 flash/high）；证据 `final-verification.json`、`final-independent-runtime-live/`。这些检查通过不能覆盖审查另找到的边界。
+
+Spec 复现：starting 重启接管遇暂时 unknown 时直接改 running，随后的 status 又将记录记为 unknown；即使原 Pi 稍后 completed，后续 tick 也不再读取。PiAdapter 的身份等待只有最多 800ms，返回时未必已有身份文件，普通启动也有相同可能。显式 requestDraft 此时会创建新 taskId，原进程未确认停止。脚本及输出 `t007-starting-unknown-repro.*` 已集中保存。
+
+已记录 PR #4 对应 head 的实际 design changes_requested，新增两个确定性回归：接收 unknown 后原任务的完成结果、显式请求不重复启动。`unknown-adoption-red.log` 实际分别失败于结果缺失和 `starts: 2 !== 1`，回归提交 `2be87c8`。现有 Runtime 第二次 retry 派发 `run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`，从该失败回归继续；批准稿和固定模板仍不变，仓库默认基准已恢复。
+
+Standards 复核确认中央日志丢失问题已关闭；结果文档尚需更正两点：state 实际为 `repair-runtime-live-state.json`，并非 `runtime-live/state.json`；`run-38…` 与 `run-cbb…` 来自两个隔离 root，每轮各 spawnCalls=2，不能合称同一次的三 session。上述固定提交的主会话唯一闭环证据没有混用这两轮。
+
+Next action：监督第二次返修，独立检查未知状态接管与去重，再核对最终 PR；用户最终验收与合并仍未授权。

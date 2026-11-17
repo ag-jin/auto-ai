@@ -42,52 +42,48 @@ flowchart LR
 
 模板改进的闭环：实际任务暴露问题 → 修改模板并验证案例 → 发布新版本 → 更新默认指针。
 
-## 当前状态
+## 启动工作台
 
-已用 Pi 的 `deepseek-flash / high` 完成首个开发任务与返修，提供可运行的执行包生成器。任务稿格式见 [WORKER_BRIEF.md](docs/WORKER_BRIEF.md)，实际记录见 [T001](docs/worker-trials/T001-task.md) 与其结果文档。
-
-Node.js 22+ 与 Git 环境下，无需安装依赖：
+需要 Node.js 22+、Git、已认证的 GitHub CLI（gh）和已配置 provider 的 Pi。开发模型固定为 `facaiai-deepseek / deepseek-flash / high`。当前 Pi 进程监控实现使用 POSIX 进程组，macOS 已实际验证。
 
 ```sh
-npm test
-npm run check:trial
-node scripts/prepare-task.mjs --input examples/task.json --template templates/development/1.2.0.md --ref HEAD
+npm ci
+npm start
 ```
 
-另已实现 SQLite 授权/调度核心与前端初版。CLI 当前显式接受模板路径；catalog 自动选择和 HTTP 联调仍在实施。**尚未实现完整的 Issue 监听和自动 Worker 调度。创建 Issue 不会自动开始执行。**
+默认地址为 `http://127.0.0.1:4310`，数据保存在 `.auto-ai/app/`。自动收集默认关闭；关闭工作台后已启动的 Pi monitor 可继续，重启按持久记录接管。
 
-运行设计、状态与恢复约定见 [DESIGN.md](docs/DESIGN.md)。下一步实施范围见 [EXECUTION_ROUTE.md](docs/EXECUTION_ROUTE.md)。
+1. 在“规则”添加仓库和基准引用，并填写要收集的仓库范围。只收集需求时本地路径可留空，开发前需要有效本地 Git 仓库。
+2. 点击“收集 Issue”，或打开应用内自动监督。查看每条观测的命中/排除原因；PR 会被排除。
+3. 只读角色整理任务稿，用户可以编辑。处理实质待决策项后，明确选择开发、暂缓或忽略。
+4. 确认当前任务稿后自动调度：独立 Pi 会话、worktree 与分支，按并发上限、优先级、依赖和写入冲突排队。
+5. Worker 返回结果后检查范围、提交推送、创建 PR 并进入验收。保存证据后回收干净且已推送的 worktree；失败或未知现场保留原因与路径。
+6. 用户与设计监督对当前 PR head 记录结论后，仍需单独明确点击合并。合并结果不明时只读核对，不重发命令、不冒充完成。
 
-## 本地 HTTP 工作台
+本版是单人本地工作台，设计监督可由同一主会话完成；两个验收角色是结论记录，不是多用户身份认证。
 
-后端与接口约定见 [RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md) 与 [HTTP_CONTRACT.md](docs/HTTP_CONTRACT.md)。HTTP 层只调用 Runtime Interface，不直接读数据库或运行清单。
-
-安装依赖（当前仅 `yaml@2.9.1`；Node.js 22+）：
+可选启动参数：
 
 ```sh
-npm install
+npm start -- --host 127.0.0.1 --port 4310 --data-dir /absolute/data --app-repo-dir /absolute/auto-ai
 ```
 
-启动工作台（需要已集成 `src/runtime.mjs`；未集成时会明确报错，不会用 mock 替代生产后端）：
+服务仅绑定 loopback。HTTP 写操作校验 Host、Origin 和内存会话令牌；Worker 不获得工作台令牌。模板来自中央 app-repo-dir 的固定 Git commit，不要求每个目标仓库自带模板。
+
+## 验证
 
 ```sh
-npm start -- --host 127.0.0.1 --port 4310 --app-repo-dir /path/to/auto-ai
+npm test                  # 当前 96 项项目测试
+npm run check:workflow    # 18 项独立领域检查
+npm run check:trial       # 35 项执行包检查
+npm run check:runtime     # 真实临时 Git + 隔离 Pi/GitHub 的闭环
+npm run check:runtime:live # 真实 Pi + 真实临时 Git；GitHub PR/合并仍是隔离替身
 ```
 
-- `--host` 仅允许 loopback，默认 `127.0.0.1`。
-- `--port` 默认 `4310`。
-- `--data-dir` 默认 `<app-repo-dir>/.auto-ai/app`。
-- `--app-repo-dir` 默认当前目录。
-- 启动会输出实际地址、数据目录与应用仓库；`SIGINT`/`SIGTERM` 会关闭 HTTP 与 Runtime。
+真实 Pi 闭环已实际通过：只读任务稿 → 模拟用户确认 → 实际 Worker → 提交推送 → fixture PR → 回收 → 验收门槛 → 合并意图重启去重。两种角色的真实会话均核对为 deepseek-flash/high。GitHub 另已真实只读收集和读回 PR；**没有执行真实 GitHub 合并**。
 
-服务只绑定 loopback，写请求需要同源来源与内存中的 `X-Auto-AI-Token`；令牌来自同源 `GET /api/state`，不通过 CORS 暴露，Worker 不获得工作台令牌。
+浏览器已检查真实后端的启动、配置保存、实际收集、排除原因及未保存输入保护。完整开发与合并闭环的运行证据来自上述脚本，不能与浏览器检查混为一谈。
 
-检查与测试：
+结果和限制见 [Runtime 监督核验](docs/worker-trials/T005-runtime-supervisor.md)、[真实后端界面检查](docs/worker-trials/UI-actual-backend-check.md)。底层 Git 创建工作树后、manifest 写入前发生崩溃时，会保留未知现场并给出阻塞；不静默删除无法确认归属的目录。
 
-```sh
-node --check public/app.js
-node --test test/http-server.test.mjs
-npm test
-```
-
-`test/http-server.test.mjs` 使用注入的 fake Runtime 验证路由、授权、CAS 409、Host/Origin/令牌、非法 JSON、超大请求、路径穿越、符号链接越界、响应脱敏与关闭流程。它覆盖 HTTP 层合同，不等于连接真实 GitHub/Pi 的完整线上验收；真实后端联调与浏览器最终检查需在 Runtime 集成后由主会话完成。
+任务稿格式见 [WORKER_BRIEF.md](docs/WORKER_BRIEF.md)。运行职责和 Interface 见 [DESIGN.md](docs/DESIGN.md)、[RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md)、[HTTP_CONTRACT.md](docs/HTTP_CONTRACT.md)。从 [CONTEXT_CARD.md](docs/CONTEXT_CARD.md) 恢复当前项目进度。

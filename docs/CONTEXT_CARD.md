@@ -1,43 +1,40 @@
 # 当前执行上下文
 
-## 目标
+## 目标与授权
 
-实现轻量的 GitHub 自动安排执行系统：规则收集 Issue → 候选需求池 → 主会话整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker 执行 → 产物与 PR → 用户和设计监督验收、明确合并。
+已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。
 
-同时提供前端 UI，覆盖规则配置、命中/排除原因、需求池、任务稿审阅、用户决定、进展与阻塞，以及 PR 验收与合并操作。
+- 模型固定 `facaiai-deepseek / deepseek-flash / high`，凭据沿用本机配置；生产不以 mock 替代外部失败。
+- 规则命中不构成开发授权；必须确认当前任务稿版本。需求或源内容改变清除旧授权，正文恢复也不恢复旧决定。
+- 模板固定 commit/path/version，在途和同稿 retry 不跟随默认模板升级。
+- 每个开发 Worker 独立会话、worktree、分支；按全局/仓库并发、优先级、显式跨仓库依赖和写入冲突调度。
+- 用户未配置额外监督线程，由主会话处理设计核验；执行者准备 PR，不自行合并。PR #1 仍待用户最终验收。
+- 可验收小步及时提交推送；已交付且保存证据的 Worker 工作树及时归档。失败或未知现场说明原因并保留。
 
-## 已确定
+## 事实来源与目录
 
-- 仓库：`ag-jin/auto-ai`。当前实施分支：`design/github-first-templates`，草稿 PR #1。
-- Worker：Pi，`deepseek-flash / high`。本机已验证的 provider 为 `facaiai-deepseek`；不复制凭据到仓库。
-- 模板可升级、保留历史版本，在途任务固定开工版本与 commit。
-- 规则支持仓库范围、标签、作者、关键词、状态与去重，并解释命中/排除原因。筛选不是开发授权。
-- 功能需求只有在用户确认其任务稿版本后才可执行。执行结果进入验收，执行线程不自行合并 PR。
-- 进展、阻塞和验证证据持久保存，中断后从项目文件、运行记录和真实进程恢复。
-- 多仓库统一监督；同仓内已确认且相互独立的任务可以并行。每个开发 Worker 使用独立会话、Git worktree 和任务分支，所有产物与 PR 绑定仓库、Issue、模板和执行标识。
-- Worker worktree 用完及时回收：先保存并集成代码与必要证据，再归档；活动任务结束前保留现场。
-- 调度支持全局/仓库级并发上限、优先级、显式跨仓库依赖和写入冲突排队；一个任务阻塞不阻塞其他就绪任务。前端显示多仓库总览、筛选、Worker、队列和原因。
+- 主集成目录：`/Users/linguojin/Workspace/auto-ai/github-first`，分支 `design/github-first-templates`；远端 `ag-jin/auto-ai`，草稿 PR #1。
+- 验收运行目录：`/Users/linguojin/.codex/worktrees/workbench-review/github-first`，分支 `review/workbench`；从集成分支快进，供当前工作台运行。
+- 运行数据与中央证据：主集成目录的 `.auto-ai/`。正式工作台数据 `.auto-ai/app/`；开发 Worker 原始记录 `.auto-ai/controller-trials/`、`.auto-ai/worker-evidence/`；测试证据 `.auto-ai/validation/`。
+- 活动服务：`http://127.0.0.1:4310/`，具体 PID/会话/目录见 `.auto-ai/workbench-server.json`；重启前先核对进程身份，避免重复启动。
+- 当前已配置 ag-jin/auto-ai，基准为尚未合并的 `design/github-first-templates`，自动收集关闭。PR #1 合并后，后续开发可将基准改为 main。
+- 实现合同：`docs/RUNTIME_CONTRACT.md`、`docs/HTTP_CONTRACT.md`；任务稿格式 `docs/WORKER_BRIEF.md`。
 
-## 当前证据
+## 实际证据
 
-T001 执行包模块已由真实 Pi 开发并返修，主会话复跑 10 项业务测试与 35 项独立检查通过。记录见 `docs/worker-trials/T001-supervisor.md`；任务稿格式见 `docs/WORKER_BRIEF.md`。
+- 项目 `npm test`：96/96；核心独立检查 18/18；执行包检查 35/35。
+- 真实 Pi 隔离闭环 6/6：需求整理、模拟用户确认、实际 Worker、真实本地 Git 提交推送、工作树回收、验收门槛、合并意图重启去重。两种角色的实际 session 逐项核对为 deepseek-flash/high。
+- 真实 GitHub：认证、Issue 列表收集与 PR #1 读回。PR 创建与合并的闭环验收使用隔离替身，未执行真实 GitHub 合并。
+- 真实浏览器：实际后端的启动、配置保存、收集、排除原因与未保存输入保护。不是完整浏览器开发/合并流程验收，不能与脚本闭环混称。
+- 实际运行服务已配置上述仓库并只读收集：1 条 PR 观测被排除、0 条命中需求、0 个开发 Run；跨 Origin 与无效令牌实际请求均 403。
+- 完整记录 `docs/worker-trials/T005-runtime-supervisor.md`，界面记录 `docs/worker-trials/UI-actual-backend-check.md`。
 
-T002 核心已实现并通过 27 项项目测试及 18 项独立检查（含四个 OS 进程原子领取），集成提交 `29653ec`。T004 前端初版已集成至 `c2cf1ec`，Pi 报告模拟后端浏览器 35 项通过；真实服务联调待完成。两棵 Worker worktree 均已归档，未合并 PR。
+## 工作树与恢复
 
-T003A Pi 执行器与 T003B 外部 Adapter 已返修并集成至 `22b1a88` / `0ce5f3d`，整合 `npm test` 实跑 63/63。Pi 已真实运行只读整理烟测；GitHub 真实只读检查与 HTTP/调度联调待完成。任务过程见各 `docs/worker-trials/T003*-result.md`。恢复时核对中央 active 与实际结果。
+T002/T003A/T003B/T004/T005A/T005B Worker 树均已归档移除；当前只保留正在运行验收工作台的 review 树。开发 active.json 已更新为 completed/integrated，恢复仍以实际 Pi result 与进程为准。没有待续跑的开发 Worker，不要重复派发。
 
-随后补充修复已提交历史绕过 writeScopes，真实 GitHub 只读收集与 PR 读回已通过。T005B HTTP/UI 已独立返修并集成至 `3e8a1cf`，主会话复跑 HTTP 13/13、补充错误响应检查 3/3；整合全量 78/78。T005B worktree 已请求归档；T005A Runtime 仍在执行，不能重复派发。独立闭环脚本正在准备，尚未通过。
-
-用户暂未配置其他监督线程，当前由主会话处理设计核验；PR 保留给用户最终确认，不因本会话核验而自行合并。
-
-## 实施路线
-
-1. T001 磨合成果已推送，提交 `748bef0`；PR #1 未合并。
-2. 固定最小领域/持久化 Interface，安排 Pi 实现规则、候选、任务稿版本、用户决定、并发/依赖/冲突与派发门槛。
-3. 实现 GitHub/Pi Adapter、HTTP Interface、持久进展和恢复。
-4. 实现中文前端，完成规则、审阅、进展与 PR 验收操作。
-5. 在隔离样例中验证最小闭环，再用系统推进后续工作；提交实际证据，等待用户和设计监督最终验收。
+Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录并阻塞；不能静默删除。未知 Pi 进程保留写入占用，不盲目重试。
 
 ## next_action
 
-按 `docs/RUNTIME_CONTRACT.md` 并行安排 T005A Runtime 与 T005B HTTP/UI；先读 `.auto-ai/T005A-active.json`、`.auto-ai/T005B-active.json`（若存在）及其 Pi monitor 状态，避免重复启动。每个可验收小步提交推送，已集成旧 worktree 保存证据后及时归档。下一步是实际后端闭环与浏览器验证。
+保持工作台供用户验收，核对并提交草稿 PR #1 的最终证据。用户明确确认前不合并，也不自行批准新的功能 Issue；后续需求先形成任务稿并等当前版本的开发决定。

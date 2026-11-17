@@ -1,41 +1,25 @@
 # Execution Route
 
-## 当前状态
-
-已集成 T001 执行包、T002 SQLite 领域核心、T003 Pi/GitHub/模板/worktree Adapter、T004 中文界面与 T005B HTTP 操作入口。集成后的主会话测试实跑 78/78，核心独立检查 18/18；Runtime T005A 仍在实施，不能将已有模块测试视为完整闭环。
-
-## 执行路线
-
-| 项目 | 约定 |
+| 项目 | 当前路线 |
 | --- | --- |
-| 目标 | Issue → 候选与任务稿 → 用户确认开发 → Worker → 验证/PR → 验收与明确合并 |
-| 本轮技能 | `writing-for-agents` 收敛任务稿；`codebase-design` 收敛职责；`web-access` 核对官方资料 |
-| 事实来源 | 用户决定、当前仓库文件、实际执行日志与 GitHub 读回结果 |
-| 现有规格 | `docs/DESIGN.md`、`docs/RUNTIME_CONTRACT.md`、`docs/HTTP_CONTRACT.md` |
-| 模板来源 | `templates/catalog.yml` 指向的版本，并固定 Git commit |
-| next_action | 核对 `.auto-ai/T005A-active.json` 与 Pi monitor；验收 Runtime，接上 HTTP，运行独立闭环与真实浏览器检查 |
+| 目标 | 可版本化模板驱动的 GitHub/Pi 本地工作台，保留用户开发确认与最终合并门槛 |
+| 技能 | writing-for-agents 维护任务稿；codebase-design 固定 Interface；frontend-design 检查界面；pr 维护审阅说明 |
+| 事实来源 | AGENTS.md、CONTEXT_CARD.md、Runtime/HTTP 合同、实际 Git/Pi/HTTP 结果 |
+| 交付 | 集成分支 design/github-first-templates、草稿 PR #1、本地 4310 工作台 |
+| next_action | 用户验收当前结果并决定合并；新需求按当前稿版本另行确认开发 |
 
-任务板、锁和调度状态后续若进入托管技能体系，应先核对当时可用的 `task-board` 所有权，保持单一事实来源。本轮没有部署运行时或修改托管技能系统。
+## 已完成的验证
 
-## 实施顺序
+- 项目测试 96/96、独立核心检查 18/18、执行包检查 35/35。
+- 隔离闭环脚本 6/6；真实 Pi + 真实临时 Git 复跑同样 6/6。
+- GitHub 真实只读收集/PR 读回，实际 HTTP/Runtime 配置与收集，Origin/令牌拒绝验证。
+- 浏览器已核对实际后端配置、收集和排除状态；完整开发流程的验证来自脚本，不冒充浏览器全流程。
+- Worker 代码和必要证据已保存并集成，全部已完成 Worker worktree 已归档；review 树仍用于当前可审阅工作台。
 
-1. **Runtime 集成**：核验 T005A 的授权、独立执行、去重、未知进程保留占用和恢复。
-2. **独立闭环**：`scripts/check-runtime.mjs`（准备中，尚未通过）使用真实临时 Git/worktree 与隔离 GitHub fixture；`--live-pi` 追加真实模型。模拟合并必须明确标注，不操作真实 PR 合并。
-3. **真实界面检查**：启动真实 HTTP/Runtime，检查多仓库配置、收集、任务稿、队列与验收；保存实际截图与操作证据。
-4. **可审查交付**：及时提交推送、更新草稿 PR #1 和证据，回收已用完 worktree。用户未配置其他监督线程，设计核验由主会话处理，最终合并仍等用户明确操作。
+运行 `npm start` 启动；其他验收入口见 README。进程与数据位置从 CONTEXT_CARD 和 `.auto-ai/workbench-server.json` 恢复，不依赖聊天摘要。
 
-GitHub Issue 和运行日志应保留可恢复记录，长任务从项目文件与实际状态继续。
+## 权限与后续
 
-## 第一项验收样例
+没有自动合并真实 PR；没有安装系统定时器、改凭据或全局 Git 设置。规则命中只进候选池，未确认当前稿不能开发。一个主会话可监督多个仓库，原任务、授权、模板、依赖和产物均持久化。
 
-在隔离测试仓库提出新增 NOTE.md 的需求，规则命中只读整理任务稿，模拟用户确认当前版本后自动调度，真实本地提交推送并生成 fixture PR，再核对验收/合并门槛和重启恢复。真实 Pi 与模拟依赖分别记录。
-
-首版尚需验证的能力不能由静态 YAML 检查替代。
-
-## 任务稿磨合入口
-
-- [六段任务稿格式](WORKER_BRIEF.md)
-- [T001 原始任务稿](worker-trials/T001-task.md)
-- [独立核验反馈](worker-trials/T001-review-r1.md)
-- [补充返修任务稿](worker-trials/T001-fix-1.md)
-- [Worker 实际交付记录](worker-trials/T001-result.md)
+新功能先收集并整理任务稿，等用户选择开发/暂缓/忽略；确认后自动调度，无需再次派发按钮。最终合并需要当前 head 的两种实际验收与明确操作；pending 结果只读核验。

@@ -2,7 +2,7 @@
 
 ## 目标与授权
 
-已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。
+已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。完整目标未结项：真实后续自举开发和用户终验/合并仍待决定，见 `docs/ACCEPTANCE_AUDIT.md`。
 
 - 模型固定 `facaiai-deepseek / deepseek-flash / high`，凭据沿用本机配置；生产不以 mock 替代外部失败。
 - 规则命中不构成开发授权；必须确认当前任务稿版本。需求或源内容改变清除旧授权，正文恢复也不恢复旧决定。
@@ -22,19 +22,23 @@
 
 ## 实际证据
 
-- 项目 `npm test`：96/96；核心独立检查 18/18；执行包检查 35/35。
+- 项目 `npm test`：101/101；核心独立检查 18/18；执行包检查 35/35，后两者对应源码 blob 已核对未变。
 - 真实 Pi 隔离闭环 6/6：需求整理、模拟用户确认、实际 Worker、真实本地 Git 提交推送、工作树回收、验收门槛、合并意图重启去重。两种角色的实际 session 逐项核对为 deepseek-flash/high。
 - 真实 GitHub：认证、Issue 列表收集与 PR #1 读回。PR 创建与合并的闭环验收使用隔离替身，未执行真实 GitHub 合并。
-- 真实浏览器：实际后端的启动、配置保存、收集、排除原因与未保存输入保护。不是完整浏览器开发/合并流程验收，不能与脚本闭环混称。
+- 真实浏览器已用 DOM 事件驱动补齐双仓库闭环：新稿保存后确认、迟到稿保留决定、并行/冲突依赖队列、失败重试、双角色验收、明确合并、pending 刷新及终态只读。Runtime/HTTP/UI/临时 Git 为真实实现，GitHub/Pi 是明确替身。原生输入通道未通过独立探针，不声称原生鼠标/键盘验收通过。
 - 实际运行服务已配置上述仓库并只读收集：1 条 PR 观测被排除、0 条命中需求、0 个开发 Run；跨 Origin 与无效令牌实际请求均 403。
-- 完整记录 `docs/worker-trials/T005-runtime-supervisor.md`，界面记录 `docs/worker-trials/UI-actual-backend-check.md`。
+- T006 修复迟到整理清用户决定和同源失败无限自动重试，独立专项 19/19、四类补充样例通过，已集成 `ed0f8cd`。界面修复恢复持久合并方式、合并后只读与匹配的 merge SHA，已集成 `6caffa0`。
+- 应用内自动监督另经实际计时验证：双仓库自动收集两轮，一仓失败不影响另一仓；同源仅一次只读整理、开发 Run=0；关闭监督后不再收集。
+- 完整记录 `docs/worker-trials/T005-runtime-supervisor.md`、`T006-supervisor.md`，界面记录 `UI-full-backend-check.md`。`scripts/serve-ui-fixture.mjs` 可复跑隔离界面场景，不被生产启动引用；停止时保留 Git bundle、清理干净自建工作树并保留未知现场。
 
 ## 工作树与恢复
 
-T002/T003A/T003B/T004/T005A/T005B Worker 树均已归档移除；当前只保留正在运行验收工作台的 review 树。开发 active.json 已更新为 completed/integrated，恢复仍以实际 Pi result 与进程为准。没有待续跑的开发 Worker，不要重复派发。
+T002/T003A/T003B/T004/T005A/T005B/T006 Worker 树均已归档移除；当前只保留正在运行验收工作台的 review 树。开发 active.json 已更新为 completed/integrated，恢复仍以实际 Pi result 与进程为准。隔离界面服务和临时 Git/工作树已停止清理，没有待续跑的开发 Worker。
 
 Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录并阻塞；不能静默删除。未知 Pi 进程保留写入占用，不盲目重试。
 
 ## next_action
 
-保持工作台供用户验收，核对并提交草稿 PR #1 的最终证据。用户明确确认前不合并，也不自行批准新的功能 Issue；后续需求先形成任务稿并等当前版本的开发决定。
+等待用户对 T007 v1 作出决定。`docs/worker-trials/T007-proposed-draft.json` 已规范化核验，rev=`10fb0c71586487f4b96ed8ce01f3e1d505962474eef697b9516f7dff130e75c5`，authorized=false；尚未创建真实 Issue 或 Worker。
+
+只有用户明确批准此版本后，才创建/复用真实 GitHub Issue，经当前工作台保存精确稿并核对 rev、记录开发决定，让 Runtime 自动安排 Pi 实现。保留实际用户终验和合并门槛。自动 goal 续跑消息不等于这份稿件的确认回执，不得据此自批开发。PR #1 继续保留供最终验收，不自行合并。

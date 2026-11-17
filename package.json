@@ -1,0 +1,14 @@
+{
+  "name": "auto-ai-github-first",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Template-driven GitHub task execution helpers",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check:trial": "node scripts/check-t001.mjs"
+  }
+}

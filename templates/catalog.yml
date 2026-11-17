@@ -2,7 +2,7 @@ schema_version: 1
 templates:
   development:
     description: 开发与修复，交付改动和验证证据。
-    default: development/1.0.0.md
+    default: development/1.1.0.md
   research:
     description: 调研与设计探索，交付有来源的结论。
     default: research/1.0.0.md

@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         说明要得到什么结果，不需要手动拆出全部步骤。
-        当前仓库处于设计阶段，表单用于整理任务，自动调度运行时尚未实现。
+        当前提供执行包原型，表单用于整理任务，自动调度运行时尚未实现。
   - type: textarea
     id: goal
     attributes:

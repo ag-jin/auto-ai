@@ -73,7 +73,7 @@ npm start -- --host 127.0.0.1 --port 4310 --data-dir /absolute/data --app-repo-d
 ## 验证
 
 ```sh
-npm test                  # 当前 96 项项目测试
+npm test                  # 当前 101 项项目测试
 npm run check:workflow    # 18 项独立领域检查
 npm run check:trial       # 35 项执行包检查
 npm run check:runtime     # 真实临时 Git + 隔离 Pi/GitHub 的闭环
@@ -82,8 +82,18 @@ npm run check:runtime:live # 真实 Pi + 真实临时 Git；GitHub PR/合并仍�
 
 真实 Pi 闭环已实际通过：只读任务稿 → 模拟用户确认 → 实际 Worker → 提交推送 → fixture PR → 回收 → 验收门槛 → 合并意图重启去重。两种角色的真实会话均核对为 deepseek-flash/high。GitHub 另已真实只读收集和读回 PR；**没有执行真实 GitHub 合并**。
 
-浏览器已检查真实后端的启动、配置保存、实际收集、排除原因及未保存输入保护。完整开发与合并闭环的运行证据来自上述脚本，不能与浏览器检查混为一谈。
+浏览器已用生产前端和真实 Runtime/HTTP 完成 DOM 事件驱动的双仓库闭环，覆盖稿件版本门槛、暂缓/忽略、并行与依赖队列、阻塞重试、双角色验收、pending 刷新及完成只读结果；GitHub/Pi 在该界面场景中是明确替身。原生输入通道的独立探针未通过，不能将 DOM 验收声称为原生鼠标/键盘验收。真实 Pi 与 Git 的 6/6 来自另一条独立脚本。
 
 结果和限制见 [Runtime 监督核验](docs/worker-trials/T005-runtime-supervisor.md)、[真实后端界面检查](docs/worker-trials/UI-actual-backend-check.md)。底层 Git 创建工作树后、manifest 写入前发生崩溃时，会保留未知现场并给出阻塞；不静默删除无法确认归属的目录。
 
 任务稿格式见 [WORKER_BRIEF.md](docs/WORKER_BRIEF.md)。运行职责和 Interface 见 [DESIGN.md](docs/DESIGN.md)、[RUNTIME_CONTRACT.md](docs/RUNTIME_CONTRACT.md)、[HTTP_CONTRACT.md](docs/HTTP_CONTRACT.md)。从 [CONTEXT_CARD.md](docs/CONTEXT_CARD.md) 恢复当前项目进度。
+
+隔离界面验收服务可复跑：
+
+```sh
+node scripts/serve-ui-fixture.mjs
+```
+
+它只创建本地临时 Git 与显式替身，不被生产启动引用。启动输出独立 URL 和 controlFile，Ctrl-C 保存状态与 Git bundle 后清理自建干净工作树；脏或未知目录保留。详细步骤和验证范围见 [界面闭环记录](docs/worker-trials/UI-full-backend-check.md)。
+
+当前目标逐项证据与尚需用户决定的部分见 [完成审计](docs/ACCEPTANCE_AUDIT.md)。T007 是待确认的真实后续任务稿，尚未创建 Issue 或获得开发授权。

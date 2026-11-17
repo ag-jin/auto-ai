@@ -659,7 +659,7 @@ test('无稿 defer/ignore、develop 严格校验、保存改变清授权、CAS �
 // 4. Concurrency, dependency, path conflict, isolated prepare failure
 // ---------------------------------------------------------------------------
 
-test('并发限额、依赖、写入冲突沿用核心；一个准备失败仍安排其他任务', async (t) => {
+test('同仓写入冲突沿用核心，原执行停止后才安排后续任务', async (t) => {
   const workspaceRoot = await tempDir(t, 't005a-ws-concurrency-');
   const { runtime, github, pi, workspace } = await makeRuntime(t, { workspaceRoot });
   await configure(runtime, {
@@ -1819,4 +1819,46 @@ test('旧格式整理记录重开后保守恢复，保留当前用户决定并�
   assert.equal(saved.state, 'discarded');
   assert.equal(saved.discarded.result.goal, '旧记录迟到结果', '丢弃的结果保留为证据');
   await restarted.close();
+});
+
+test('全局仅一个槽位时，准备失败释放占用并继续安排另一仓库', async (t) => {
+  const { runtime, github, pi, workspace } = await makeRuntime(t, { tickMs: 60000 });
+  try {
+    await configure(runtime, {
+      repositories: [
+        { repo: REPO, localPath: '/tmp/prepare-failure', baseRef: 'main' },
+        { repo: OTHER_REPO, localPath: '/tmp/eligible-source', baseRef: 'main' },
+      ],
+      rules: { repositories: [REPO, OTHER_REPO] },
+      concurrency: { global: 1, perRepo: 1 },
+    });
+    await runtime.start();
+    github.setIssues(REPO, [issue(1)]);
+    github.setIssues(OTHER_REPO, [issue(1, { repo: OTHER_REPO })]);
+    await runtime.collect();
+    for (const call of pi.startCalls.filter(call => call.role === 'draft')) {
+      const failedRepo = call.prompt.includes(`"repo": "${REPO}"`);
+      pi.complete(call.id, draftOutput({ priority: failedRepo ? 10 : 0 }));
+    }
+    await runtime.tick();
+    const drafted = await runtime.getState();
+    for (const candidate of drafted.candidates) {
+      await runtime.decide(candidate.id, { action: 'develop', draftRev: candidate.draft.rev });
+    }
+    workspace.failCreate.add(REPO);
+    await runtime.tick();
+    const state = await runtime.getState();
+    const failed = latestRunFor(state, candidateId(1));
+    const running = latestRunFor(state, candidateId(1, OTHER_REPO));
+    assert.equal(failed.status, 'blocked');
+    assert.match(failed.blockedReason, /准备执行失败/);
+    assert.equal(state.candidates.find(c => c.id === candidateId(1)).activeRunId, null);
+    assert.equal(running.status, 'running');
+    assert.equal(pi.startCalls.filter(call => call.role === 'worker').length, 1);
+    assert.equal(pi.startCalls.find(call => call.role === 'worker').id, running.id);
+    assert.equal(workspace.createCalls[0].repo, REPO);
+    assert.equal(workspace.createCalls[1].repo, OTHER_REPO);
+  } finally {
+    await runtime.close();
+  }
 });

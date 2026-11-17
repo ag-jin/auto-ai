@@ -2088,6 +2088,52 @@ test('中断在启动窗口的整理记录按同一 task id 接管，缺失时�
   await restarted.close();
 });
 
+test('启动窗口重启遇暂时 unknown 后仍只读接管同一任务的完成结果', async (t) => {
+  const { runtime, github, pi, workspace, dataDir } = await makeRuntime(t, { tickMs: 600000 });
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+  const call = pi.startCalls[0];
+  await runtime.close();
+  const file = draftRecordPath(dataDir, candidateId(1));
+  const record = JSON.parse(await readFile(file, 'utf8'));
+  record.state = 'starting';
+  await writeFile(file, JSON.stringify(record));
+  pi.markUnknown(call.id, 'request 已落盘，process/result 暂未落盘');
+  const restarted = new Runtime({ dataDir, appRepoDir: APP_REPO, github, pi, workspace, tickMs: 600000 });
+  t.after(() => restarted.close());
+  await restarted.start();
+  pi.complete(call.id, draftOutput({ goal: '稍后可确认的同一请求' }));
+  await restarted.tick();
+  const state = await restarted.getState();
+  assert.equal(state.candidates.find(c => c.id === candidateId(1)).draft?.goal, '稍后可确认的同一请求');
+  assert.equal(pi.startCalls.length, 1, '接管只能读原 taskId，不能再次启动模型');
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(saved.promptRef, record.promptRef);
+  assert.equal(saved.promptText, record.promptText);
+});
+
+test('Pi.start 返回后暂时 unknown 时显式整理不重复启动且仍接收原结果', async (t) => {
+  const { runtime, github, pi } = await makeRuntime(t, { tickMs: 600000 });
+  t.after(() => runtime.close());
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+  const call = pi.startCalls[0];
+  pi.markUnknown(call.id, '模拟 PiAdapter 800ms 先返回，进程身份稍后才落盘');
+  await runtime.tick();
+  try { await runtime.requestDraft(candidateId(1)); }
+  catch (error) { assert.equal(error.statusCode, 409, '可以明确拒绝未确认停止的旧请求'); }
+  assert.equal(pi.startCalls.length, 1, '旧进程未确认停止，不得启动新的 taskId');
+  pi.complete(call.id, draftOutput({ goal: '启动后迟到的原结果' }));
+  await runtime.tick();
+  const state = await runtime.getState();
+  assert.equal(state.candidates.find(c => c.id === candidateId(1)).draft?.goal, '启动后迟到的原结果');
+  assert.equal(state.runs.length, 0, '接管不会授权开发');
+});
+
 test('全局仅一个槽位时，准备失败释放占用并继续安排另一仓库', async (t) => {
   const { runtime, github, pi, workspace } = await makeRuntime(t, { tickMs: 60000 });
   try {

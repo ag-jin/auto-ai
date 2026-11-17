@@ -1,5 +1,9 @@
 # T007 结果：需求整理方法纳入版本化模板
 
+> **监督第二次返修要求（2026-11-18）**：head 756235e 的独立全量 108/108、真实 Pi 6/6 均通过，但新鲜上下文另外复现：starting 重启接管遇暂时 unknown 后仍永久停查，Pi 稍后 completed 也无稿；PiAdapter 的身份等待最多 800ms 后先返回也会触发。这不是终止证明。两个新增 Runtime 回归当前应失败。请让未知任务保留原 taskId/promptRef/promptText、继续只读核对，能接收其后 running/completed；在旧任务未确认停止前，显式整理也不得盲目新建任务。自动收集不能重调模型；sourceRev/CAS/后续用户决定仍优先；真实终止失败可按既有显式重试语义继续。不要通过延长固定 sleep 或改 PiAdapter 掩盖状态问题。
+>
+> 审查复现脚本/输出与主会话最终独立证据均在中央 `.auto-ai/validation/T007/`。同时更正下方两处证据文字：中央 state 路径为 `repair-runtime-live-state.json`；`run-38…` 与 `run-cbb…` 来自两轮独立隔离检查，不能称为同一次闭环的三条 session。实际生产 Issue/Run/PR 与测试替身需分开。保留历史失败证据、用新的独立子目录保存本轮日志，更新本文状态后交付；本轮仍使用原批准任务稿与固定模板。
+
 > 监督返修已完成（2026-11-18，attempt 2）：首轮真实 Pi 复核复现启动竞态——draft 记录先写 `running`，Pi.start 尚在等待进程身份时 tick 先调 status 得到 unknown；实际 Pi 随后 completed，Runtime 却永久不接管。本轮在既有 Runtime 范围修复：整理记录先写 `starting`，只有 Pi.start 返回后才转 `running` 并接受轮询；中断在 `starting` 的记录在重启时按同一 task id 只读核对 Pi 现场后接管或明确失败，绝不重新调用模型。复现（红）与修复后（绿）、全量回归和真实 Pi 隔离闭环均已实际运行，日志与完整 Pi 记录保存在中央目录 `.auto-ai/validation/T007/`。
 >
 > 首轮本工作树内的 runtime-live 证据已随回收丢失，不再引用；本文件下方“实际检查”只引用中央目录内可读取的日志。首轮失败现场仍保存在中央 `independent-start-race/`。

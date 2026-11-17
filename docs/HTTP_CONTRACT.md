@@ -20,6 +20,8 @@
 }
 ```
 
+`templates` 只包含可执行的 worker 模板，每项为 `{id,version,role:'worker',description,path,templateRef,commit}`。draft 角色的 requirements 整理模板不提供给前端选择，develop 入口也会拒绝 draft 模板。
+
 Candidate DTO：
 
 ```js

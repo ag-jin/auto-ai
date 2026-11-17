@@ -7,10 +7,29 @@ const CATALOG_PATH = 'templates/catalog.yml';
 const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const ROLES = new Set(['worker', 'draft']);
 const MAX_BUFFER = 16 * 1024 * 1024;
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Templates written before roles existed are worker templates. `draft` is only
+ * valid for the read-only requirements method and never grants tools.
+ */
+function normalizeRole(value, label) {
+  if (value === undefined || value === null) {
+    return 'worker';
+  }
+  if (typeof value !== 'string') {
+    throw new Error(`${label} role 必须是字符串`);
+  }
+  const role = value.trim();
+  if (!ROLES.has(role)) {
+    throw new Error(`${label} role 必须是 worker 或 draft`);
+  }
+  return role;
 }
 
 function defaultRun(command, args, options = {}) {
@@ -172,13 +191,14 @@ function requireTemplateMeta(meta, { id, templatePath, label }) {
   if (!VERSION_PATTERN.test(meta.version)) {
     throw new Error(`${label} 的版本格式无效：${meta.version}`);
   }
+  const role = normalizeRole(meta.role, label);
   const expectedPath = `templates/${id}/${meta.version}.md`;
   if (templatePath !== expectedPath) {
     throw new Error(
       `${label} 路径 ${templatePath} 与 id/版本不一致，应为 ${expectedPath}`,
     );
   }
-  return { id: meta.id, version: meta.version };
+  return { id: meta.id, version: meta.version, role };
 }
 
 async function resolveCommit({ repoDir, ref, run }) {
@@ -246,16 +266,53 @@ async function loadTemplate({ repoDir, commit, id, templatePath, run }) {
     templatePath,
     label: `模板 ${templatePath}`,
   });
-  return { text, version: validated.version };
+  return { text, version: validated.version, role: validated.role };
 }
+
+/**
+ * Resolves one catalog entry and validates its declared role. The catalog role
+ * is optional (old catalogs only had description/default), but when present it
+ * must agree with the template frontmatter.
+ */
+async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRole }) {
+  const templatePath = catalogDefaultToRepoPath(
+    entry.default,
+    `模板 ${id} 的 catalog default`,
+  );
+  const catalogRole =
+    entry.role === undefined
+      ? null
+      : normalizeRole(entry.role, `模板 ${id} 的 catalog`);
+  const template = await loadTemplate({
+    repoDir,
+    commit,
+    id,
+    templatePath,
+    run,
+  });
+  if (catalogRole !== null && catalogRole !== template.role) {
+    throw new Error(
+      `模板 ${id} 的 catalog role ${catalogRole} 与模板 role ${template.role} 不一致`,
+    );
+  }
+  if (expectedRole !== null && template.role !== expectedRole) {
+    throw new Error(`模板 ${id} 的 role 为 ${template.role}，不能作为 ${expectedRole} 模板`);
+  }
+  return { ...template, path: templatePath };
+}
+
 
 /**
  * Resolves the current catalog default for a template id at exactly one commit.
  * Catalog and template text are both read from that commit, never the working tree.
  */
-export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run } = {}) {
+export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run, expectedRole } = {}) {
   const normalizedRepoDir = path.resolve(requireTrimmedString(repoDir, 'repoDir'));
   const templateId = requireId(id);
+  const role =
+    expectedRole === undefined || expectedRole === null
+      ? null
+      : normalizeRole(expectedRole, 'expectedRole');
   const runner = run ?? defaultRun;
   const commit = await resolveCommit({ repoDir: normalizedRepoDir, ref, run: runner });
   const catalog = await loadCatalog({ repoDir: normalizedRepoDir, commit, run: runner });
@@ -264,33 +321,34 @@ export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run } = {}) {
   if (!isObject(entry)) {
     throw new Error(`模板 catalog 中没有 id ${templateId}`);
   }
-  const templatePath = catalogDefaultToRepoPath(
-    entry.default,
-    `模板 ${templateId} 的 catalog default`,
-  );
-  const template = await loadTemplate({
+  const template = await resolveCatalogEntry({
     repoDir: normalizedRepoDir,
     commit,
     id: templateId,
-    templatePath,
+    entry,
     run: runner,
+    expectedRole: role,
   });
 
   return {
     commit,
-    path: templatePath,
+    path: template.path,
     id: templateId,
     version: template.version,
+    role: template.role,
     text: template.text,
-    templateRef: `${commit}:${templatePath}`,
+    templateRef: `${commit}:${template.path}`,
   };
 }
 
 /**
- * Lists every template default in the catalog at exactly one commit.
+ * Lists template defaults at exactly one commit, optionally filtered by role so
+ * the development UI only offers worker execution templates.
  */
-export async function listTemplates({ repoDir, ref = 'HEAD', run } = {}) {
+export async function listTemplates({ repoDir, ref = 'HEAD', run, role } = {}) {
   const normalizedRepoDir = path.resolve(requireTrimmedString(repoDir, 'repoDir'));
+  const expectedRole =
+    role === undefined || role === null ? null : normalizeRole(role, 'role');
   const runner = run ?? defaultRun;
   const commit = await resolveCommit({ repoDir: normalizedRepoDir, ref, run: runner });
   const catalog = await loadCatalog({ repoDir: normalizedRepoDir, commit, run: runner });
@@ -305,23 +363,24 @@ export async function listTemplates({ repoDir, ref = 'HEAD', run } = {}) {
     if (entry.description !== undefined && typeof entry.description !== 'string') {
       throw new Error(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
     }
-    const templatePath = catalogDefaultToRepoPath(
-      entry.default,
-      `模板 ${templateId} 的 catalog default`,
-    );
-    const template = await loadTemplate({
+    const template = await resolveCatalogEntry({
       repoDir: normalizedRepoDir,
       commit,
       id: templateId,
-      templatePath,
+      entry,
       run: runner,
+      expectedRole: null,
     });
+    if (expectedRole !== null && template.role !== expectedRole) {
+      continue;
+    }
     templates.push({
       id: templateId,
       version: template.version,
+      role: template.role,
       description: entry.description ?? '',
-      path: templatePath,
-      templateRef: `${commit}:${templatePath}`,
+      path: template.path,
+      templateRef: `${commit}:${template.path}`,
       commit,
     });
   }

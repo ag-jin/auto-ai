@@ -1090,8 +1090,9 @@ test('Workspace archive 对未推送工作树保留现场', async (t) => {
 // Template adapter
 // ---------------------------------------------------------------------------
 
-function templateText(id, version, body) {
-  return `---\nschema_version: 1\nid: ${id}\nversion: "${version}"\n---\n\n${body}\n`;
+function templateText(id, version, body, role) {
+  const roleLine = role ? `role: ${role}\n` : '';
+  return `---\nschema_version: 1\nid: ${id}\nversion: "${version}"\n${roleLine}---\n\n${body}\n`;
 }
 
 const VALID_CATALOG = `schema_version: 1
@@ -1257,5 +1258,110 @@ templates:
   await assert.rejects(
     () => resolveTemplate({ repoDir: wrongTemplateId.repo, id: 'development' }),
     /与 catalog 的 development 不一致/,
+  );
+});
+
+test('roles: requirements 必须为 draft，旧 worker 模板默认为 worker，role 与入口一致', async (t) => {
+  const catalog = `schema_version: 1
+templates:
+  development:
+    description: 开发
+    default: development/1.2.0.md
+  research:
+    description: 调研
+    default: research/1.0.0.md
+  requirements:
+    description: 只读整理
+    role: draft
+    default: requirements/1.0.0.md
+`;
+  const files = {
+    'templates/development/1.2.0.md': templateText('development', '1.2.0', '# 开发'),
+    'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+    'templates/requirements/1.0.0.md': templateText(
+      'requirements',
+      '1.0.0',
+      '# 只读整理\n不能执行命令',
+      'draft',
+    ),
+  };
+  const { repo, commit } = await makeTemplateRepo(t, { catalog, files });
+
+  // Templates without a role stay compatible as worker templates.
+  const worker = await resolveTemplate({ repoDir: repo, id: 'development', expectedRole: 'worker' });
+  assert.equal(worker.role, 'worker');
+  const draft = await resolveTemplate({
+    repoDir: repo,
+    id: 'requirements',
+    expectedRole: 'draft',
+  });
+  assert.equal(draft.role, 'draft');
+  assert.equal(draft.templateRef, `${commit}:templates/requirements/1.0.0.md`);
+  assert.match(draft.text, /不能执行命令/);
+
+  const all = await listTemplates({ repoDir: repo, ref: 'HEAD' });
+  assert.deepEqual(
+    all.map((item) => `${item.id}@${item.version}:${item.role}`),
+    ['development@1.2.0:worker', 'requirements@1.0.0:draft', 'research@1.0.0:worker'],
+  );
+  const workerOnly = await listTemplates({ repoDir: repo, ref: 'HEAD', role: 'worker' });
+  assert.deepEqual(workerOnly.map((item) => item.id), ['development', 'research']);
+  const draftOnly = await listTemplates({ repoDir: repo, ref: 'HEAD', role: 'draft' });
+  assert.deepEqual(draftOnly.map((item) => item.id), ['requirements']);
+
+  // A worker entry cannot be used for the read-only draft role and vice versa.
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo, id: 'development', expectedRole: 'draft' }),
+    /不能作为 draft 模板/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo, id: 'requirements', expectedRole: 'worker' }),
+    /不能作为 worker 模板/,
+  );
+});
+
+test('roles: 非法 role、catalog 与模板 role 不一致都拒绝', async (t) => {
+  const invalidRole = await makeTemplateRepo(t, {
+    files: {
+      'templates/development/1.0.0.md': templateText(
+        'development',
+        '1.0.0',
+        '# 非法',
+        'admin',
+      ),
+      'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+    },
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: invalidRole.repo, id: 'development' }),
+    /role 必须是 worker 或 draft/,
+  );
+
+  const catalogMismatch = await makeTemplateRepo(t, {
+    catalog: `schema_version: 1
+templates:
+  development:
+    description: role 冲突
+    role: draft
+    default: development/1.0.0.md
+`,
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: catalogMismatch.repo, id: 'development' }),
+    /catalog role draft 与模板 role worker 不一致/,
+  );
+
+  const invalidCatalogRole = await makeTemplateRepo(t, {
+    catalog: `schema_version: 1
+templates:
+  development:
+    description: role 非法
+    role: tools
+    default: development/1.0.0.md
+`,
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: invalidCatalogRole.repo, id: 'development' }),
+    /catalog role 必须是 worker 或 draft/,
   );
 });

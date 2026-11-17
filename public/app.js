@@ -826,6 +826,8 @@ function syncAcceptanceInputs() {
   for (const candidate of candidatesAll()) {
     if (!candidate || !candidate.id) continue;
     const entry = acceptanceEntry(candidate);
+    const persistedMethod = candidate.mergeIntent?.method;
+    if (MERGE_METHODS.some(method => method.value === persistedMethod)) entry.method = persistedMethod;
     const pr = candidate.latestResult?.pr;
     const head = str(pr?.headSha);
     if (entry.prHead !== head) {
@@ -2988,6 +2990,9 @@ function renderReviewCard(role, review, pr) {
 }
 
 function renderAcceptanceForm(candidate, reviews, pr) {
+  if (candidate.state === "completed") {
+    return h("p", { class: "hint" }, "当前 PR 已确认合并，验收记录只读。");
+  }
   const entry = acceptanceEntry(candidate);
   const idBase = `accept-${safeId(candidate.id)}`;
   const headReady = Boolean(entry.headSha.trim());
@@ -3127,6 +3132,14 @@ function renderMergeBox(candidate, pr, reviews) {
   const state = mergeState(candidate, pr, reviews);
   const box = h("div", { class: "merge-box" });
   box.append(h("h4", {}, "合并 PR"));
+  if (candidate.state === "completed") {
+    box.append(h("p", {}, "合并已确认，无需再次提交合并请求。"));
+    const mergedRun = runsForCandidate(candidate.id).find(run => run.status === "completed"
+      && run.result?.pr?.number === pr?.number && run.result?.pr?.headSha === pr?.headSha);
+    const mergeSha = mergedRun?.result?.merge?.mergeSha;
+    if (mergeSha) box.append(h("p", { class: "mono" }, `Merge commit：${mergeSha}`));
+    return box;
+  }
   if (mergePending(candidate)) {
     box.append(
       h(
@@ -3271,6 +3284,9 @@ function mergeState(candidate, pr, reviews) {
 
   if (mergePending(candidate)) {
     add("pending", "合并结果待核验", "合并结果待核验，不重复发送");
+  }
+  if (candidate.state === "completed") {
+    add("done", "PR 已确认合并", "该 PR 已合并，无需再次提交");
   }
 
   if (pr) add("done", "存在关联 PR");

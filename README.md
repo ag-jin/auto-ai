@@ -34,7 +34,7 @@ flowchart LR
 ## 模板与版本
 
 - [默认模板目录](templates/catalog.yml)：主会话从这里找到当前采用的版本。
-- [开发交付 v1.1.0](templates/development/1.1.0.md)：调查、实现、验证、交付；保留 v1.0.0 固定引用。
+- [开发交付 v1.2.0](templates/development/1.2.0.md)：确认、并行执行、核验、交付；保留 v1.0.0/v1.1.0 固定引用。
 - [调研交付 v1.0.0](templates/research/1.0.0.md)：收敛问题、核对来源、比较与结论。
 - [GitHub 任务表单](.github/ISSUE_TEMPLATE/task.yml)：只收集输入，执行方法由主会话选择。
 
@@ -51,9 +51,9 @@ Node.js 22+ 与 Git 环境下，无需安装依赖：
 ```sh
 npm test
 npm run check:trial
-node scripts/prepare-task.mjs --input examples/task.json --template templates/development/1.1.0.md --ref HEAD
+node scripts/prepare-task.mjs --input examples/task.json --template templates/development/1.2.0.md --ref HEAD
 ```
 
-CLI 当前显式接受模板路径；catalog 自动选择尚未实现。**尚未实现 Issue 监听、主会话运行时或自动 Worker 调度。创建 Issue 不会自动开始执行。**
+另已实现 SQLite 授权/调度核心与前端初版。CLI 当前显式接受模板路径；catalog 自动选择和 HTTP 联调仍在实施。**尚未实现完整的 Issue 监听和自动 Worker 调度。创建 Issue 不会自动开始执行。**
 
 运行设计、状态与恢复约定见 [DESIGN.md](docs/DESIGN.md)。下一步实施范围见 [EXECUTION_ROUTE.md](docs/EXECUTION_ROUTE.md)。

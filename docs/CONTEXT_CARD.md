@@ -22,7 +22,9 @@
 
 T001 执行包模块已由真实 Pi 开发并返修，主会话复跑 10 项业务测试与 35 项独立检查通过。记录见 `docs/worker-trials/T001-supervisor.md`；任务稿格式见 `docs/WORKER_BRIEF.md`。
 
-目前未实现规则收集、用户确认门槛、调度运行时或前端 UI。T001 通过不代表完整闭环已经完成。
+T002 核心已实现并通过 27 项项目测试及 17 项独立检查，集成提交 `29653ec`。T004 前端初版已集成至 `c2cf1ec`，Pi 报告模拟后端浏览器 35 项通过；真实服务联调待完成。两棵 Worker worktree 均已归档，未合并 PR。
+
+T003A Pi 执行器正在独立工作树执行，实际状态与日志位置见 `.auto-ai/T003A-active.json`。目前尚未完成 GitHub 收集、HTTP 服务、自动 Worker 调度与真实 UI 联调。
 
 ## 实施路线
 
@@ -34,4 +36,4 @@ T001 执行包模块已由真实 Pi 开发并返修，主会话复跑 10 项业�
 
 ## next_action
 
-派发 T002 领域与授权/调度门槛任务，在独立 worktree 执行。长任务继续以本文件和对应任务记录恢复，不以聊天摘要代替执行事实。
+监督 T003A；并行安排 T003B GitHub/模板/worktree Adapter。之后集成 HTTP 与 UI，验证最小闭环。恢复时先读取 active.json 与对应 launch.json，核对真实进程，不重复启动。

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   draft_version INTEGER NOT NULL DEFAULT 0,
   draft_stale INTEGER NOT NULL DEFAULT 0,
   decision TEXT,
+  pinned_template TEXT,
   active_run_id TEXT,
   priority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
@@ -130,6 +131,7 @@ export class Store {
       }
       this.#db.exec('PRAGMA foreign_keys = ON;');
       this.#db.exec(SCHEMA);
+      this.#ensureColumn('candidates', 'pinned_template', 'TEXT');
     } catch (error) {
       this.#db.close();
       throw error;
@@ -138,6 +140,14 @@ export class Store {
 
   get raw() {
     return this.#db;
+  }
+
+  #ensureColumn(table, column, definition) {
+    const columns = this.#db.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.some((entry) => entry.name === column)) {
+      return;
+    }
+    this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   close() {

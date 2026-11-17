@@ -15,6 +15,9 @@ const DECISION_ACTIONS = new Set(['develop', 'defer', 'ignore']);
 const ACCEPTANCE_ROLES = new Set(['user', 'design']);
 const ACCEPTANCE_VERDICTS = new Set(['approved', 'changes_requested']);
 const ACTIVE_RUN_STATUS = 'running';
+const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+const TEMPLATE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const TEMPLATE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
 
 const STATE_REASONS = {
   candidate: '候选尚未形成任务稿',
@@ -211,6 +214,42 @@ function normalizePr(pr, runRepo) {
   return { repo, number: pr.number, url, headSha };
 }
 
+function normalizePinnedTemplate(value) {
+  if (!isObject(value)) {
+    throw new Error('decision.template 必须是对象');
+  }
+  const commit = requireTrimmedString(value.commit, 'decision.template.commit');
+  if (!COMMIT_PATTERN.test(commit)) {
+    throw new Error('decision.template.commit 必须是完整的 40 或 64 位十六进制提交 SHA');
+  }
+  const templatePath = requireTrimmedString(value.path, 'decision.template.path');
+  if (templatePath.includes('\\') || templatePath.includes('\0')) {
+    throw new Error('decision.template.path 必须使用规范正斜杠相对路径');
+  }
+  const segments = templatePath.split('/');
+  if (
+    segments.length < 3 ||
+    segments[0] !== 'templates' ||
+    segments.some((segment) => segment === '' || segment === '.' || segment === '..') ||
+    !templatePath.endsWith('.md')
+  ) {
+    throw new Error('decision.template.path 必须是 templates/ 下的 .md 文件');
+  }
+  const id = requireTrimmedString(value.id, 'decision.template.id');
+  if (!TEMPLATE_ID_PATTERN.test(id)) {
+    throw new Error('decision.template.id 格式无效');
+  }
+  const version = requireTrimmedString(value.version, 'decision.template.version');
+  if (!TEMPLATE_VERSION_PATTERN.test(version)) {
+    throw new Error('decision.template.version 格式无效');
+  }
+  const expectedPath = `templates/${id}/${version}.md`;
+  if (templatePath !== expectedPath) {
+    throw new Error(`decision.template.path 与 id/版本不一致，应为 ${expectedPath}`);
+  }
+  return { commit, path: templatePath, id, version, templateRef: `${commit}:${templatePath}` };
+}
+
 function scopesConflict(left, right) {
   if (left.includes('*') || right.includes('*')) {
     return true;
@@ -223,6 +262,10 @@ function scopesConflict(left, right) {
     }
   }
   return false;
+}
+
+function draftedRevForRow(decidedRev) {
+  return decidedRev === null ? '' : decidedRev;
 }
 
 function hasValidDevelopDecision(candidate) {
@@ -290,6 +333,7 @@ function candidateFromRow(row) {
     draft: row.draft ? JSON.parse(row.draft) : null,
     draftStale: Boolean(row.draft_stale),
     decision: row.decision ? JSON.parse(row.decision) : null,
+    pinnedTemplate: row.pinned_template ? JSON.parse(row.pinned_template) : null,
     activeRunId: row.active_run_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -377,7 +421,7 @@ export class Workflow {
     return JSON.parse(row.value);
   }
 
-  saveSettings(settings) {
+  saveSettings(settings, { allowEmptyLocalPath = false } = {}) {
     if (!isObject(settings)) {
       throw new Error('settings 必须是对象');
     }
@@ -410,6 +454,7 @@ export class Workflow {
         localPath: requireTrimmedString(
           entry.localPath,
           `settings.repositories[${index}].localPath`,
+          { allowEmpty: allowEmptyLocalPath },
         ),
         baseRef: requireTrimmedString(entry.baseRef, `settings.repositories[${index}].baseRef`),
       });
@@ -525,6 +570,7 @@ export class Workflow {
               state = existing.draft ? 'awaiting_decision' : 'candidate';
             }
             this.#store.run('DELETE FROM acceptances WHERE candidate_id = ?', id);
+            this.#store.run('UPDATE candidates SET pinned_template = NULL WHERE id = ?', id);
           }
 
           this.#store.run(
@@ -650,7 +696,7 @@ export class Workflow {
       this.#store.run(
         `UPDATE candidates
            SET draft = ?, draft_rev = ?, draft_version = ?, draft_stale = 0,
-               decision = NULL, state = ?, priority = ?, updated_at = ?
+               decision = NULL, pinned_template = NULL, state = ?, priority = ?, updated_at = ?
          WHERE id = ?`,
         JSON.stringify(draft),
         draft.rev,
@@ -700,7 +746,10 @@ export class Workflow {
       if (typeof action !== 'string' || !DECISION_ACTIONS.has(action)) {
         throw new Error('decision.action 只能是 develop、defer 或 ignore');
       }
-      const draftRev = requireTrimmedString(input.draftRev, 'decision.draftRev');
+      let draftRev = '';
+      if (input.draftRev !== undefined && input.draftRev !== null) {
+        draftRev = requireTrimmedString(input.draftRev, 'decision.draftRev');
+      }
       const actor = requireTrimmedString(input.actor, 'decision.actor');
       if (actor !== 'user') {
         throw new Error('只有用户（actor=user）可以做出开发决定');
@@ -708,17 +757,8 @@ export class Workflow {
       if (!candidate.filter.matched) {
         throw new Error(`候选 ${id} 未命中收集规则，不能获得开发授权`);
       }
-      if (!candidate.draft) {
-        throw new Error(`候选 ${id} 还没有任务稿，不能做出决定`);
-      }
-      if (candidate.draftStale) {
-        throw new Error(`候选 ${id} 的任务稿已因 Issue 源内容变化失效，请重新保存`);
-      }
       if (candidate.state === 'completed') {
         throw new Error(`候选 ${id} 已完成；需要新的任务稿或源内容变化后才能重新决定`);
-      }
-      if (draftRev !== candidate.draft.rev) {
-        throw new Error(`决定的 draftRev 与当前任务稿版本不一致，拒绝旧版本批准`);
       }
 
       const running = this.#store.get(
@@ -729,21 +769,42 @@ export class Workflow {
         throw new Error(`候选 ${id} 仍有执行中的 Run，活动开发结束前不能重新批准`);
       }
 
-      if (action === 'develop') {
-        if (candidate.draft.acceptance.length === 0) {
-          throw new Error('任务稿验收项为空，不能批准开发');
+      if (!candidate.draft) {
+        if (action === 'develop') {
+          throw new Error(`候选 ${id} 还没有任务稿，不能做出开发决定`);
         }
-        if (candidate.draft.pendingDecisions.length > 0) {
-          throw new Error('任务稿仍有待决策项，不能批准开发');
+      } else {
+        if (candidate.draftStale) {
+          throw new Error(`候选 ${id} 的任务稿已因 Issue 源内容变化失效，请重新保存`);
+        }
+        if (draftRev !== candidate.draft.rev) {
+          throw new Error('决定的 draftRev 与当前任务稿版本不一致，拒绝旧版本批准');
+        }
+        if (action === 'develop') {
+          if (candidate.draft.acceptance.length === 0) {
+            throw new Error('任务稿验收项为空，不能批准开发');
+          }
+          if (candidate.draft.pendingDecisions.length > 0) {
+            throw new Error('任务稿仍有待决策项，不能批准开发');
+          }
         }
       }
 
+      const decidedRev = candidate.draft ? candidate.draft.rev : null;
+      const pinnedTemplate =
+        action === 'develop' && input.template !== undefined && decidedRev !== null
+          ? { ...normalizePinnedTemplate(input.template), draftRev: decidedRev }
+          : null;
+
       const at = now();
-      const decision = { action, draftRev: candidate.draft.rev, actor: 'user', at };
+      const decision = { action, draftRev: decidedRev, actor: 'user', at };
       const state = DECISION_STATES[action];
       this.#store.run(
-        'UPDATE candidates SET decision = ?, state = ?, updated_at = ? WHERE id = ?',
+        `UPDATE candidates
+           SET decision = ?, pinned_template = ?, state = ?, updated_at = ?
+         WHERE id = ?`,
         JSON.stringify(decision),
+        pinnedTemplate === null ? null : JSON.stringify(pinnedTemplate),
         state,
         at,
         id,
@@ -753,7 +814,7 @@ export class Workflow {
          VALUES (?, ?, ?, ?, ?)`,
         id,
         action,
-        decision.draftRev,
+        draftedRevForRow(decidedRev),
         'user',
         at,
       );
@@ -765,6 +826,16 @@ export class Workflow {
         repo: candidate.issue.repo,
         data: decision,
       });
+      if (pinnedTemplate) {
+        this.#store.appendEvent({
+          at,
+          kind: 'template.pinned',
+          message: `候选 ${id} 固定模板 ${pinnedTemplate.templateRef}`,
+          candidateId: id,
+          repo: candidate.issue.repo,
+          data: pinnedTemplate,
+        });
+      }
       return candidateFromRow(this.#store.get('SELECT * FROM candidates WHERE id = ?', id));
     });
   }
@@ -904,6 +975,96 @@ export class Workflow {
     });
   }
 
+  /**
+   * Records the real Pi process identity after the adapter has spawned it.
+   * Kept separate from bindExecution because the process exists only after the
+   * template, branch and worktree have been persisted.
+   */
+  attachRunProcess(runId, input) {
+    if (!isObject(input)) {
+      throw new Error('进程信息必须是对象');
+    }
+    let pid = null;
+    if (input.pid !== undefined && input.pid !== null) {
+      if (!Number.isSafeInteger(input.pid) || input.pid < 1) {
+        throw new Error('pid 必须是正整数');
+      }
+      pid = input.pid;
+    }
+    let sessionId = null;
+    if (input.sessionId !== undefined && input.sessionId !== null) {
+      sessionId = requireTrimmedString(input.sessionId, 'sessionId');
+    }
+
+    return this.#store.transaction(() => {
+      const run = this.#requireRunRow(runId);
+      if (run.status !== ACTIVE_RUN_STATUS) {
+        throw new Error(`Run ${runId} 当前状态为 ${run.status}，不能绑定进程信息`);
+      }
+      if (!run.template_ref || !run.branch || !run.worktree_path) {
+        throw new Error(`Run ${runId} 尚未绑定模板与工作目录，不能绑定进程信息`);
+      }
+      const at = now();
+      this.#store.run(
+        `UPDATE runs SET pid = ?, session_id = ?, phase = 'started', updated_at = ?
+         WHERE id = ?`,
+        pid,
+        sessionId,
+        at,
+        runId,
+      );
+      this.#store.appendEvent({
+        at,
+        kind: 'run.started',
+        message: `Run ${runId} 的 Pi 进程已记录`,
+        candidateId: run.candidate_id,
+        runId,
+        repo: run.repo,
+        data: { pid, sessionId },
+      });
+      return runFromRow(this.#store.get('SELECT * FROM runs WHERE id = ?', runId));
+    });
+  }
+
+  listAcceptances(candidateId) {
+    const rows = this.#store.all(
+      'SELECT * FROM acceptances WHERE candidate_id = ? ORDER BY id ASC',
+      requireTrimmedString(candidateId, 'candidateId'),
+    );
+    return rows.map(acceptanceFromRow);
+  }
+
+  /**
+   * Latest acceptance per role, used by the state DTO. `null` means the role
+   * has not recorded a verdict for the current candidate.
+   */
+  latestAcceptances(candidateId) {
+    const latest = { user: null, design: null };
+    for (const acceptance of this.listAcceptances(candidateId)) {
+      latest[acceptance.role] = acceptance;
+    }
+    return latest;
+  }
+
+  recordEvent(input) {
+    if (!isObject(input)) {
+      throw new Error('事件必须是对象');
+    }
+    const kind = requireTrimmedString(input.kind, 'kind');
+    const message = requireTrimmedString(input.message, 'message');
+    const at = now();
+    this.#store.appendEvent({
+      at,
+      kind,
+      message,
+      candidateId: input.candidateId ?? null,
+      runId: input.runId ?? null,
+      repo: input.repo ?? null,
+      data: input.data ?? null,
+    });
+    return at;
+  }
+
   recordProgress(runId, input) {
     if (!isObject(input)) {
       throw new Error('进展信息必须是对象');
@@ -952,6 +1113,11 @@ export class Workflow {
 
   getRun(id) {
     return runFromRow(this.#requireRunRow(id));
+  }
+
+  latestRun(candidateId) {
+    const row = this.#currentRunRow(requireTrimmedString(candidateId, 'candidateId'));
+    return row ? runFromRow(row) : null;
   }
 
   // ---------------------------------------------------------------------
@@ -1082,6 +1248,12 @@ export class Workflow {
       }
       if (!hasValidDevelopDecision(candidate)) {
         throw new Error(`候选 ${id} 没有与当前任务稿一致的用户开发授权，不能重试`);
+      }
+      if (
+        candidate.pinnedTemplate &&
+        candidate.pinnedTemplate.draftRev !== candidate.draft.rev
+      ) {
+        throw new Error(`候选 ${id} 的固定模板不属于当前任务稿版本，不能重试`);
       }
       if (candidate.state === 'ready') {
         return candidate;
@@ -1421,6 +1593,11 @@ export class Workflow {
         deny('开发授权不是用户决定');
       } else if (candidate.decision.draftRev !== draft.rev) {
         deny('开发授权对应旧任务稿版本');
+      } else if (
+        candidate.pinnedTemplate &&
+        candidate.pinnedTemplate.draftRev !== draft.rev
+      ) {
+        deny('固定模板对应旧任务稿版本');
       }
     }
 

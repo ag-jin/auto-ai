@@ -248,6 +248,23 @@ export class GitHubAdapter {
     return rawIssues.map((raw) => normalizeRawIssue(raw, targetRepo));
   }
 
+  async readIssue({ repo, number } = {}) {
+    const targetRepo = requireRepo(repo);
+    const issueNumber = requirePositiveInteger(number, 'number');
+
+    const { stdout } = await this.#gh(
+      [
+        'api',
+        '-H',
+        'Accept: application/vnd.github+json',
+        `repos/${targetRepo}/issues/${issueNumber}`,
+      ],
+      `读取 ${targetRepo} 的 Issue #${issueNumber}`,
+    );
+    const raw = parseJson(stdout, `读取 ${targetRepo} 的 Issue #${issueNumber}`);
+    return normalizeRawIssue(raw, targetRepo);
+  }
+
   async #listOpenPullRequests(repo, branch, baseBranch) {
     const { stdout } = await this.#gh(
       [

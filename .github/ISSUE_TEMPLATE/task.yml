@@ -1,0 +1,37 @@
+name: 安排一件事
+description: 提供目标与验收要求，由主会话选择标准模板并安排执行。
+title: "[任务] "
+labels: ["auto:inbox"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        说明要得到什么结果，不需要手动拆出全部步骤。
+        当前仓库处于设计阶段，表单用于整理任务，自动调度运行时尚未实现。
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目标
+      description: 需要解决什么问题，或交付什么结果？
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收要求
+      description: 用可观察的结果说明怎样才算完成。
+      placeholder: |
+        - 预期行为或交付物
+        - 需要通过的检查
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与限制
+      description: 可涉及的项目或文件、明确限制、依赖与已有决定；没有则留空。
+  - type: textarea
+    id: context
+    attributes:
+      label: 背景与参考
+      description: 复现步骤、相关 Issue、资料、截图或其他上下文；没有则留空。

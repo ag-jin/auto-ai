@@ -1,0 +1,6 @@
+.DS_Store
+.auto-ai/
+*.log
+.env
+.env.*
+!.env.example

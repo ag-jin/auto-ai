@@ -29,21 +29,21 @@ Candidate DTO：
   filter: { matched: true, reasons: ['...'] },
   state: 'awaiting_decision',
   draft: {
-    version: 1, rev: 'sha256:...', requirementsRev: 'sha256:...',
+    version: 1, rev: '<opaque-current-revision>', requirementsRev: 'sha256:...',
     templateId: 'development', goal: '...', scope: '...', acceptance: ['...'],
     context: '...', pendingDecisions: [], writeScopes: ['*'], dependsOn: [], priority: 0
   },
   decision: null, activeRunId: null,
   eligibility: { eligible: false, reasons: ['尚未确认开发'] },
   reviews: { user: null, design: null },
-  latestResult: null,
+  latestResult: null, mergePending: false,
   createdAt, updatedAt
 }
 ```
 
 draft 可为 null。review 非空时包含 `{verdict,headSha,comment,at}`。latestResult 为 `{summary,artifacts,evidence,pr}`，pr 可空或 `{repo,number,url,headSha}`。
 
-Run DTO 至少包含 `{id,candidateId,repo,issueRef,draftRev,requirementsRev,status,phase,templateRef,branch,worktreePath,result,createdAt,updatedAt}`。状态 running/blocked/completed；phase 表示准备、执行、检查、提交 PR 等当前阶段。
+Run DTO 至少包含 `{id,candidateId,repo,issueRef,draftRev,requirementsRev,status,phase,templateRef,branch,worktreePath,result,blockedReason,createdAt,updatedAt}`。状态 running/blocked/awaiting_acceptance/completed；phase 表示准备、执行、检查、提交 PR 等当前阶段。
 
 Candidate 状态：candidate、drafting、awaiting_decision、deferred、ignored、ready、running、blocked、awaiting_acceptance、completed。前端按中文含义展示，未知状态原样作为待识别状态展示，不能默认为成功。
 
@@ -61,12 +61,12 @@ Event 为 `{id,at,kind,message,candidateId,runId,repo,data}`。只展示必要�
 | `POST /api/collect` | `{}`，启动一次收集，返回 `{started:true}`；各仓库失败分别留事件，不使其他仓库失去处理机会 |
 | `POST /api/runtime/watch` | `{enabled,intervalSeconds}`，仅应用内监督循环；返回 runtime |
 | `POST /api/candidates/:id/draft` | `{}`，安排只读需求整理；不触发开发 |
-| `PUT /api/candidates/:id/draft` | 完整 Draft 输入字段，返回新 Candidate |
-| `POST /api/candidates/:id/decision` | `{action:'develop'|'defer'|'ignore',draftRev}`；actor 由服务端固定为 user |
+| `PUT /api/candidates/:id/draft` | 完整 Draft 输入字段及当前 `rev`（首次 null），CAS 冲突返回 409，成功返回新 Candidate |
+| `POST /api/candidates/:id/decision` | `{action:'develop'|'defer'|'ignore',draftRev}`；actor 由服务端固定为 user。无稿时可暂缓/忽略并省略 draftRev；develop 严格匹配当前稿 |
 | `POST /api/candidates/:id/retry` | `{}`，仅在当前开发授权仍有效且原执行已终止时重新入队 |
 | `POST /api/runs/:id/cancel` | `{}`，请求并确认进程停止后记入阻塞，保留工作目录 |
 | `POST /api/candidates/:id/acceptance` | `{role:'user'|'design',verdict:'approved'|'changes_requested',headSha,comment}`，记录对应角色对指定提交的验收；设计验收 comment 需给出监督结论或引用 |
-| `POST /api/candidates/:id/merge` | `{expectedHeadSha,confirmed:true,method:'merge'|'squash'|'rebase'}`；核对两种验收与 GitHub 当前 head 后才执行，返回 `{merged:true,mergeSha}` |
+| `POST /api/candidates/:id/merge` | `{expectedHeadSha,confirmed:true,method:'merge'|'squash'|'rebase'}`；核对两种验收与 GitHub 当前 head 后才执行。实际 MERGED + 完整 SHA 返回 `{merged:true,mergeSha}`；未确认结果返回 `{merged:false,pending:true,note}`，后台只读核对，不重复发送。state 中 Candidate.mergePending=true |
 
 develop 成功后由监督循环自动领取，不要求用户再次点击派发。需求版本变化清除旧授权；有待决策项或空验收的任务稿不能批准。合并始终是独立的用户操作，不因检查通过、两种验收存在或后台循环运行而自动发生。
 

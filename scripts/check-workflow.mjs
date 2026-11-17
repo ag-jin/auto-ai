@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { execFile } from 'node:child_process';
 
 const root = process.cwd();
 const modulePath = process.argv[2] || path.join(root, 'src/workflow.mjs');
@@ -124,6 +125,15 @@ try {
     await seed(w, [issue(1)]); await approve(w, 'org/one#1'); const second = new Workflow({ dbPath });
     try { const first = await w.claimNext(); assert.ok(first); assert.equal(await second.claimNext(), null); assert.equal((await second.listRuns()).length, 1); }
     finally { await second.close(); }
+  }));
+  await check('four OS processes atomically claim one candidate once', () => withWorkflow(async (w, dbPath) => {
+    await seed(w, [issue(1)]); await approve(w, 'org/one#1');
+    const code = `import { Workflow } from ${JSON.stringify(pathToFileURL(path.resolve(modulePath)).href)}; const w=new Workflow({dbPath:${JSON.stringify(dbPath)}});try{const r=w.claimNext();console.log(JSON.stringify({id:r?.id??null}));}finally{w.close();}`;
+    const outputs = await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve, reject) => {
+      execFile(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10000 }, (error, stdout) => error ? reject(error) : resolve(JSON.parse(stdout)));
+    })));
+    assert.equal(outputs.filter((value) => value.id !== null).length, 1);
+    assert.equal((await w.listRuns()).length, 1);
   }));
   await check('state and events survive close and reopen', async () => {
     const dbPath = path.join(folder, `persistence-${++sequence}.sqlite`); let w = new Workflow({ dbPath });

@@ -22,9 +22,11 @@
 
 T001 执行包模块已由真实 Pi 开发并返修，主会话复跑 10 项业务测试与 35 项独立检查通过。记录见 `docs/worker-trials/T001-supervisor.md`；任务稿格式见 `docs/WORKER_BRIEF.md`。
 
-T002 核心已实现并通过 27 项项目测试及 17 项独立检查，集成提交 `29653ec`。T004 前端初版已集成至 `c2cf1ec`，Pi 报告模拟后端浏览器 35 项通过；真实服务联调待完成。两棵 Worker worktree 均已归档，未合并 PR。
+T002 核心已实现并通过 27 项项目测试及 18 项独立检查（含四个 OS 进程原子领取），集成提交 `29653ec`。T004 前端初版已集成至 `c2cf1ec`，Pi 报告模拟后端浏览器 35 项通过；真实服务联调待完成。两棵 Worker worktree 均已归档，未合并 PR。
 
-T003A Pi 执行器正在独立工作树执行，实际状态与日志位置见 `.auto-ai/T003A-active.json`。目前尚未完成 GitHub 收集、HTTP 服务、自动 Worker 调度与真实 UI 联调。
+T003A Pi 执行器与 T003B 外部 Adapter 已返修并集成至 `22b1a88` / `0ce5f3d`，整合 `npm test` 实跑 63/63。Pi 已真实运行只读整理烟测；GitHub 真实只读检查与 HTTP/调度联调待完成。任务过程见各 `docs/worker-trials/T003*-result.md`。恢复时核对中央 active 与实际结果。
+
+用户暂未配置其他监督线程，当前由主会话处理设计核验；PR 保留给用户最终确认，不因本会话核验而自行合并。
 
 ## 实施路线
 
@@ -36,4 +38,4 @@ T003A Pi 执行器正在独立工作树执行，实际状态与日志位置见 `
 
 ## next_action
 
-监督 T003A；并行安排 T003B GitHub/模板/worktree Adapter。之后集成 HTTP 与 UI，验证最小闭环。恢复时先读取 active.json 与对应 launch.json，核对真实进程，不重复启动。
+按 `docs/RUNTIME_CONTRACT.md` 并行安排 T005A Runtime 与 T005B HTTP/UI；先读 `.auto-ai/T005A-active.json`、`.auto-ai/T005B-active.json`（若存在）及其 Pi monitor 状态，避免重复启动。每个可验收小步提交推送，已集成旧 worktree 保存证据后及时归档。下一步是实际后端闭环与浏览器验证。

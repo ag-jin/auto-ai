@@ -2,7 +2,7 @@
 
 ## 目标与授权
 
-已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。完整目标未结项：真实后续自举开发和用户终验/合并仍待决定，见 `docs/ACCEPTANCE_AUDIT.md`。
+已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。T007 已经真实用户批准并经完整系统自举和返修；完整目标仍待最终交付及用户终验/合并，见 `docs/ACCEPTANCE_AUDIT.md`。
 
 - 模型固定 `facaiai-deepseek / deepseek-flash / high`，凭据沿用本机配置；生产不以 mock 替代外部失败。
 - 规则命中不构成开发授权；必须确认当前任务稿版本。需求或源内容改变清除旧授权，正文恢复也不恢复旧决定。
@@ -22,18 +22,18 @@
 
 ## 实际证据
 
-- 项目 `npm test`：101/101；核心独立检查 18/18；执行包检查 35/35，后两者对应源码 blob 已核对未变。
+- T007 最新代码 `425db49`：主会话独立 `npm test` 111/111、真实 Pi 隔离闭环 6/6；draft/worker 共两个真实 session 均已核对 flash/high，证据 `.auto-ai/validation/T007/attempt3/independent-verification.json`。代码与最小复现审查快照指纹一致，最终结果文档正在收尾。既有核心独立检查 18/18、执行包 35/35。
 - 真实 Pi 隔离闭环 6/6：需求整理、模拟用户确认、实际 Worker、真实本地 Git 提交推送、工作树回收、验收门槛、合并意图重启去重。两种角色的实际 session 逐项核对为 deepseek-flash/high。
-- 真实 GitHub：认证、Issue 列表收集与 PR #1 读回。PR 创建与合并的闭环验收使用隔离替身，未执行真实 GitHub 合并。
+- 真实 GitHub：Issue #2 创建/收集/源版本读回；完整 Runtime 已实际派发 T007 并创建、读回 PR #3/#4，两次 design changes_requested 和 retry 有真实记录。尚未执行真实 GitHub 合并；隔离检查的合并仍为明确替身。
 - 真实浏览器已用 DOM 事件驱动补齐双仓库闭环：新稿保存后确认、迟到稿保留决定、并行/冲突依赖队列、失败重试、双角色验收、明确合并、pending 刷新及终态只读。Runtime/HTTP/UI/临时 Git 为真实实现，GitHub/Pi 是明确替身。原生输入通道未通过独立探针，不声称原生鼠标/键盘验收通过。
-- 实际运行服务已配置上述仓库并只读收集：1 条 PR 观测被排除、0 条命中需求、0 个开发 Run；跨 Origin 与无效令牌实际请求均 403。
+- 首次正式收集时 1 条 PR 观测被排除、0 条命中需求、0 个开发 Run；后来 T007 真实 Issue 已经批准执行。跨 Origin 与无效令牌实际请求均 403。
 - T006 修复迟到整理清用户决定和同源失败无限自动重试，独立专项 19/19、四类补充样例通过，已集成 `ed0f8cd`。界面修复恢复持久合并方式、合并后只读与匹配的 merge SHA，已集成 `6caffa0`。
 - 应用内自动监督另经实际计时验证：双仓库自动收集两轮，一仓失败不影响另一仓；同源仅一次只读整理、开发 Run=0；关闭监督后不再收集。
 - 完整记录 `docs/worker-trials/T005-runtime-supervisor.md`、`T006-supervisor.md`，界面记录 `UI-full-backend-check.md`。`scripts/serve-ui-fixture.mjs` 可复跑隔离界面场景，不被生产启动引用；停止时保留 Git bundle、清理干净自建工作树并保留未知现场。
 
 ## 工作树与恢复
 
-T002/T003A/T003B/T004/T005A/T005B/T006 Worker 树均已归档移除；当前只保留正在运行验收工作台的 review 树。开发 active.json 已更新为 completed/integrated，恢复仍以实际 Pi result 与进程为准。隔离界面服务和临时 Git/工作树已停止清理，没有待续跑的开发 Worker。
+T002/T003A/T003B/T004/T005A/T005B/T006 Worker 树均已归档移除；T007 前两轮 Worker 树也已由 Runtime 回收，第三轮正在交付收尾，当前 review 目录固定代码提交供独立检查。恢复以 `.auto-ai/T007-active.json`、实际 Pi result 与进程为准。隔离界面服务和已完成测试的临时 Git/工作树均已清理。
 
 Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录并阻塞；不能静默删除。未知 Pi 进程保留写入占用，不盲目重试。
 

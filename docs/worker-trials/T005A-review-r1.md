@@ -9,6 +9,8 @@
 
 独立结果 `.auto-ai/validation/T005A/merge-race.json`：mutations=2、afterReadback.pending=true、candidateState=completed。
 
+3. 通过公开 Workflow 准备已领取、固定模板的 Run，保存 control.prepare=`{status:'preparing',template,...}` 后关闭实例，模拟准备中断。新 Runtime.start 的实际结果是 workspace.create=0、Pi.start=0，Run 变 blocked，原因是读取 undefined 的 packetPath。代码把已有 preparing 记录误当完整 prepared，未恢复准备步骤。独立脚本 `.auto-ai/validation/T005A/prepare-recovery.mjs`，结果 `prepare-recovery.json`。
+
 ## 期望与回归
 
 - 同一候选的并发 merge，在检查 intent、刷新来源、验证验收、写意图、发命令全过程串行或复用同一个在途 Promise。第二个请求只读/复用，不发第二个 merge；不同候选互不阻塞。
@@ -16,5 +18,6 @@
 - `#reconcileIntent` 始终返回一种稳定结构；确认 MERGED 的显式请求本次就返回 `{merged:true,mergeSha}`，并与 getState 一致。
 - 覆盖一次发送前后异常、两个并发显式请求、显式请求与 tick 并发、pending→只读 MERGED、重启后同样路径；无需再发合并命令。
 - 在 core.recordMerged 完成后、intent 写成 merged 前中断，重启读回能从持久结果恢复 merge SHA，不能 completed 却永远返回 pending。
+- preparing 记录重启后继续幂等 workspace.create/准备 packet，准备齐全后才绑定并 spawn；有既存 manifest 时复用同一工作树。至少覆盖创建前和创建后、prepared 记录写入前的中断，不能留下无人关联的工作树或误入 blocked。
 
 只改 src/runtime*.mjs、test/runtime.test.mjs、docs/worker-trials/T005A-result.md；保留原授权、独立 Worker、scope 与恢复功能。先复现再修复，专项及全量检查实际跑。主会话负责提交，不修改 HTTP/UI 或合同，不真实合并 PR。

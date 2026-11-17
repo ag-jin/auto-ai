@@ -7,6 +7,12 @@
 - 两者集成后的主会话 `npm test`：63/63；`node scripts/check-workflow.mjs`：18/18。完整输出在 `.auto-ai/integrated-test.log`，不能等同 HTTP/UI 闭环验收。
 - 没有执行真实 GitHub 合并。PR #1 保持 OPEN。
 
+## 提交范围补充核验
+
+主会话用真实临时 Git 仓库补出两个失败回归：Worker 已提交越界文件后，干净或混合工作区会绕过检查；越界文件后来被删除，发布的历史仍包含该提交。修复后校验从 baseCommit 到当前 HEAD 的每个待发布提交及工作区路径，提交 hook 运行后再核验一次，超范围时不 add/commit/push。专项检查 29/29，红绿日志为 `.auto-ai/validation/T003B/scope-{red,green}.log`。
+
+真实 GitHubAdapter 的 auth、收集、PR 读回检查也已完成：观测只有 PR #1，正确保留 isPullRequest=true；PR state=open、mergeSha=null，没有将其作为开发 Issue。证据 `.auto-ai/validation/T003B/live-readonly.json`。
+
 集成提交：A `22b1a88`，B `0ce5f3d`。执行 session/原始日志与模板引用保存在中央 `.auto-ai/`；工作树内返修测试日志回收前复制到中央 trial evidence。
 
 Next action：T005A/T005B 接上 Runtime 与 HTTP/UI，实际验证授权到交付的闭环。

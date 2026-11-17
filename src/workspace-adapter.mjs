@@ -756,6 +756,38 @@ export class WorkspaceAdapter {
     return parseLsRemote(result.stdout);
   }
 
+  async #assertDeliveryScopes(context, scopes, snapshot) {
+    // A Worker may have committed before handing control back. Validate every
+    // commit that would be published, including paths later reverted.
+    const history = await this.#git(context.targetPath,
+      ['rev-list', '--max-count=2001', `${context.targetBase}..${snapshot.headSha}`],
+      '检查待发布的任务提交');
+    const commits = history.stdout.trim().split('\n').filter(Boolean);
+    if (commits.length > 2000) throw new Error('任务提交数超过 2000，保留现场并拒绝推送');
+    const paths = new Set(snapshot.paths);
+    for (const commit of commits) {
+      const changed = await this.#git(context.targetPath,
+        ['diff-tree', '-m', '--root', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit],
+        '检查已提交的写入范围');
+      for (const file of changed.stdout.split('\0').filter(Boolean)) paths.add(file);
+      if (paths.size > MAX_CHANGED_PATHS) break;
+    }
+    if (paths.size > MAX_CHANGED_PATHS) {
+      throw new Error(`变更文件数超过上限 ${MAX_CHANGED_PATHS}，拒绝提交异常大变更`);
+    }
+    const outside = [...paths].filter(file => !pathMatchesScopes(file, scopes));
+    if (outside.length) {
+      throw new Error(`变更超出 writeScopes（${scopes.join('、')}）：${outside.slice(0, 20).join('、')}`);
+    }
+    for (const file of paths) {
+      let stats;
+      try { stats = await lstat(path.join(context.targetPath, file)); } catch { continue; }
+      if (stats.isFile() && stats.size > MAX_FILE_BYTES) {
+        throw new Error(`文件 ${file} 大小 ${stats.size} 字节超过单文件上限 ${MAX_FILE_BYTES}，拒绝提交`);
+      }
+    }
+  }
+
   async commitAndPush({
     repo,
     worktreePath,
@@ -778,6 +810,7 @@ export class WorkspaceAdapter {
     });
 
     const before = await this.inspect({ worktreePath: context.targetPath });
+    await this.#assertDeliveryScopes(context, scopes, before);
     if (!before.dirty) {
       const remoteSha = await this.#remoteBranchSha(context.targetPath, context.targetBranch);
       if (remoteSha === before.headSha) {
@@ -822,33 +855,6 @@ export class WorkspaceAdapter {
       };
     }
 
-    if (before.paths.length > MAX_CHANGED_PATHS) {
-      throw new Error(
-        `变更文件数 ${before.paths.length} 超过上限 ${MAX_CHANGED_PATHS}，拒绝提交异常大变更`,
-      );
-    }
-    const outside = before.paths.filter((filePath) => !pathMatchesScopes(filePath, scopes));
-    if (outside.length > 0) {
-      throw new Error(
-        `变更超出 writeScopes（${scopes.join('、')}）：${outside.slice(0, 20).join('、')}${
-          outside.length > 20 ? ` 等 ${outside.length} 个路径` : ''
-        }`,
-      );
-    }
-    for (const filePath of before.paths) {
-      let stats;
-      try {
-        stats = await lstat(path.join(context.targetPath, filePath));
-      } catch {
-        continue;
-      }
-      if (stats.isFile() && stats.size > MAX_FILE_BYTES) {
-        throw new Error(
-          `文件 ${filePath} 大小 ${stats.size} 字节超过单文件上限 ${MAX_FILE_BYTES}，拒绝提交`,
-        );
-      }
-    }
-
     await this.#git(
       context.targetPath,
       ['add', '-A', '--', ...before.paths],
@@ -889,6 +895,12 @@ export class WorkspaceAdapter {
     const headSha = headResult.stdout.trim();
     if (!COMMIT_PATTERN.test(headSha)) {
       throw new Error('提交后的 HEAD 不是有效提交 SHA');
+    }
+
+    const afterCommit = await this.inspect({ worktreePath: context.targetPath });
+    await this.#assertDeliveryScopes(context, scopes, afterCommit);
+    if (afterCommit.dirty || afterCommit.headSha !== headSha) {
+      throw new Error('提交后工作树仍有变更或 HEAD 改变，保留现场并拒绝推送');
     }
 
     const remoteBefore = await this.#remoteBranchSha(

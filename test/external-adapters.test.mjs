@@ -877,6 +877,37 @@ test('Workspace commitAndPush 先检查 writeScopes，超范围拒绝且不 add�
   );
 });
 
+test('Workspace commitAndPush 拒绝 Worker 已提交的越界文件，干净或混合工作区均不推送', async (t) => {
+  for (const dirty of [false, true]) {
+    const fixture = await setupWorkspace(t, { runId: `committed-outside-${dirty}` });
+    const { source, adapter, baseCommit, runId } = fixture;
+    const created = await adapter.create({ repo: REPO, localPath: source, runId });
+    await writeRepoFile(created.worktreePath, 'outside.txt', 'out of scope\n');
+    const workerHead = await commitAll(created.worktreePath, 'worker committed outside');
+    if (dirty) await writeRepoFile(created.worktreePath, 'src/allowed.txt', 'allowed\n');
+    await assert.rejects(() => adapter.commitAndPush({
+      repo: REPO, ...created, baseCommit, writeScopes: ['src'], summary: 'must reject',
+    }), /超出 writeScopes/);
+    assert.equal(await gitOut(created.worktreePath, ['rev-parse', 'HEAD']), workerHead);
+    assert.equal(await gitOut(created.worktreePath, ['diff', '--cached', '--name-only']), '');
+    assert.equal(await gitOut(source, ['ls-remote', '--heads', 'origin', `refs/heads/${created.branch}`]), '');
+  }
+});
+
+test('Workspace commitAndPush 检查将要发布的历史，已撤回的越界提交仍不能推送', async (t) => {
+  const { source, adapter, baseCommit, runId } = await setupWorkspace(t);
+  const created = await adapter.create({ repo: REPO, localPath: source, runId });
+  await writeRepoFile(created.worktreePath, 'outside.txt', 'temporary outside\n');
+  await commitAll(created.worktreePath, 'outside in history');
+  await rm(path.join(created.worktreePath, 'outside.txt'));
+  await writeRepoFile(created.worktreePath, 'src/allowed.txt', 'allowed\n');
+  await commitAll(created.worktreePath, 'revert outside but history remains');
+  await assert.rejects(() => adapter.commitAndPush({
+    repo: REPO, ...created, baseCommit, writeScopes: ['src'], summary: 'must reject history',
+  }), /超出 writeScopes/);
+  assert.equal(await gitOut(source, ['ls-remote', '--heads', 'origin', `refs/heads/${created.branch}`]), '');
+});
+
 test('Workspace commitAndPush 将 shell 元字符路径当数据处理', async (t) => {
   const { source, adapter, baseCommit, runId } = await setupWorkspace(t);
   const created = await adapter.create({ repo: REPO, localPath: source, runId });

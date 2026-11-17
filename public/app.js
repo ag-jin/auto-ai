@@ -582,7 +582,7 @@ function filterReasons(candidate) {
 }
 
 function eligibilityReasons(candidate) {
-  return stringList(candidate?.eligibility?.reasons);
+  return unique(stringList(candidate?.eligibility?.reasons));
 }
 
 function filteredCandidates() {
@@ -1540,7 +1540,7 @@ function renderCandidateDetail(candidate) {
   const eligibility = eligibilityReasons(candidate);
   const draft = candidate.draft;
   const draftEntry = ui.drafts.get(candidate.id) || null;
-  const editable = EDITABLE_DRAFT_STATES.has(candidate.state);
+  const editable = matched && EDITABLE_DRAFT_STATES.has(candidate.state);
 
   const container = h("div", { class: "candidate-detail" });
 
@@ -1573,8 +1573,8 @@ function renderCandidateDetail(candidate) {
           () => requestDraft(candidate),
           {
             size: "small",
-            disabled: !hasToken(),
-            title: "只读整理需求，不触发开发",
+            disabled: !hasToken() || !matched,
+            title: matched ? "只读整理需求，不触发开发" : "该条目未命中收集规则",
           },
         ),
       ),
@@ -1695,7 +1695,7 @@ function renderDraftSection(candidate, draft, entry, editable) {
           {
             type: "button",
             class: "btn btn-primary",
-            disabled: !hasToken() || ui.pending.has(`draft-request:${candidate.id}`),
+            disabled: !hasToken() || candidate.filter?.matched !== true || ui.pending.has(`draft-request:${candidate.id}`),
             onclick: () => requestDraft(candidate),
           },
           ui.pending.has(`draft-request:${candidate.id}`) ? "请求中…" : "请求整理任务稿",
@@ -2020,6 +2020,8 @@ function updateDraftChrome(id) {
 
 function developBlockers(candidate, entry) {
   const reasons = [];
+  if (candidate.filter?.matched !== true) reasons.push("该条目未命中收集规则");
+  if (candidate.draftStale) reasons.push("Issue 内容已变化，请重新审阅并保存任务稿");
   if (!candidate.draft) reasons.push("尚无可审阅的任务稿");
   else if (!candidate.draft.rev) reasons.push("任务稿缺少版本 rev，不能确认");
   if (candidate.draft && entry?.dirty) reasons.push("有未保存的任务稿修改，请先保存");
@@ -3491,7 +3493,7 @@ function renderSettingsView() {
           ),
         ),
       ),
-      h("p", { class: "hint" }, "未选择状态时提交空状态列表；其含义由后端规则决定，当前合同未进一步约束。"),
+      h("p", { class: "hint" }, "未选择状态时，收集打开和已关闭的 Issue。"),
     ),
     h(
       "p",

@@ -43,4 +43,6 @@ Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录
 
 真实 Issue `ag-jin/auto-ai#2` 已被当前工作台收集；Pi 只读整理完成后，按 CAS 保存批准的精确内容，draft_rev 与 requirements_rev 均匹配，再记录 develop。自动整理稿占持久版本 1，批准内容保存为持久版本 2；批准对应的内容 rev 不变。Runtime 已自动启动 `run-01a73750-61af-414e-9407-d286c7b03af4`，开发模板固定 `d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`。
 
-监督这次真实执行、独立复跑检查并核验 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准包括创建 Issue、实施和提交 PR，不包括最终用户验收或合并；PR #1 仍待最终验收。
+首轮实际提交 PR #3 并自动回收 Worker 树。独立全量 106/106 通过，但真实 Pi 复核发现启动竞态：tick 在 Pi.start 返回前误判 unknown，实际已完成结果不再接管。已在 PR #3 记录设计 changes_requested，并提交确定性失败回归 `835e638`；失效的工作树内自测证据引用同时要求修正。
+
+现有 Runtime 的 retry 已派发返修 `run-a5500446-44b8-4b27-9238-6b844132e932`，从首轮代码与失败回归 `835e638` 继续，仍沿用原批准稿与模板固定引用。仓库默认基准已恢复为 design/github-first-templates。监督该既有返修、独立验证并核验最终 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准不包括最终用户验收或合并；PR #1 仍待最终验收。

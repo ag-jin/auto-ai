@@ -1,5 +1,7 @@
 # T007 结果：需求整理方法纳入版本化模板
 
+> **监督第二次返修已完成（2026-11-18，attempt 3）**：确认 head 756235e 的复现——`starting` 重启接管或运行中整理遇上暂时 `unknown` 被当成终止失败，原 taskId 永久停查，稍后 completed 也不成稿；显式整理还会另建 taskId。本轮修复：新增整理记录状态 `unconfirmed`（属在途且可轮询），保留原 taskId/promptRef/promptText 与只读核对，接受其后的 running → 回到 `running`、completed → 按既有 sourceRev/CAS/决定快照保护应用；`unconfirmed` 期间自动收集与显式 `requestDraft` 都不新建模型任务；缺失任务（status 抛错）仍记具体 `failed` 并走既有显式重试语义。未改 PiAdapter、未用固定 sleep 掩盖。三条 Runtime 回归先红（`attempt3-red-before-fix.log`）后绿，全量回归、独立闭环与真实 Pi 闭环均已实际运行，日志在中央 `.auto-ai/validation/T007/attempt3/`。
+>
 > **监督第二次返修要求（2026-11-18）**：head 756235e 的独立全量 108/108、真实 Pi 6/6 均通过，但新鲜上下文另外复现：starting 重启接管遇暂时 unknown 后仍永久停查，Pi 稍后 completed 也无稿；PiAdapter 的身份等待最多 800ms 后先返回也会触发。这不是终止证明。两个新增 Runtime 回归当前应失败。请让未知任务保留原 taskId/promptRef/promptText、继续只读核对，能接收其后 running/completed；在旧任务未确认停止前，显式整理也不得盲目新建任务。自动收集不能重调模型；sourceRev/CAS/后续用户决定仍优先；真实终止失败可按既有显式重试语义继续。不要通过延长固定 sleep 或改 PiAdapter 掩盖状态问题。
 >
 > 审查复现脚本/输出与主会话最终独立证据均在中央 `.auto-ai/validation/T007/`。同时更正下方两处证据文字：中央 state 路径为 `repair-runtime-live-state.json`；`run-38…` 与 `run-cbb…` 来自两轮独立隔离检查，不能称为同一次闭环的三条 session。实际生产 Issue/Run/PR 与测试替身需分开。保留历史失败证据、用新的独立子目录保存本轮日志，更新本文状态后交付；本轮仍使用原批准任务稿与固定模板。
@@ -8,12 +10,12 @@
 >
 > 首轮本工作树内的 runtime-live 证据已随回收丢失，不再引用；本文件下方“实际检查”只引用中央目录内可读取的日志。首轮失败现场仍保存在中央 `independent-start-race/`。
 
-- run_id：`run-a5500446-44b8-4b27-9238-6b844132e932`（首轮 `run-01a73750-61af-414e-9407-d286c7b03af4`）
-- attempt：2
+- run_id：`run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`（attempt 2 `run-a5500446-44b8-4b27-9238-6b844132e932`，首轮 `run-01a73750-61af-414e-9407-d286c7b03af4`）
+- attempt：3
 - template_ref：`d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`
 - requirements_rev：`sha256:a0ef7b417f1dee351d7c06e2fb87cd15ab22417ddfca5eb2c9ea6458fb5acb4d`
-- 开工基线：`d5993e3`；任务分支：`auto-ai/run-a5500446-44b8-4b27-9238-6b844132e932`
-- 首轮提交：`80b3447`、`b762697`；返修回红：`835e638`；返修修复：`84e2bec`；结果记录更新紧随其后
+- 开工基线：`d5993e3`；任务分支：`auto-ai/run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`（attempt 3 起点 `2be87c8`，已推送到远端）；attempt 2 分支为 `auto-ai/run-a5500446-44b8-4b27-9238-6b844132e932`
+- 首轮提交：`80b3447`、`b762697`；attempt 1 返修回红：`835e638`；返修修复：`84e2bec`；attempt 2 返修回红：`2be87c8`；attempt 3 修复：`425db49`；结果记录更新紧随其后
 - 任务稿：`docs/worker-trials/T007-task.md` v1（用户已批准，见 `T007-approval.md`）
 
 ## 交付内容
@@ -40,6 +42,13 @@
    - 并发的 `requestDraft`、`activeDraftIds` 和重启恢复都按 `starting|running` 视为在途，启动与监督共用同一 task id。
    - 重启时发现 `starting` 记录：按同一 task id 只读 `pi.status`，存在则接管为 `running` 并记 `draft.recovered`；缺失或读取失败则记具体 `failed` 阻塞，不重新调用模型。
    - 回归：`test/runtime-edges.test.mjs` 的启动竞态用例先红后绿；`test/runtime.test.mjs` 新增启动窗口接管/缺失用例。
+6. 暂时 unknown 只读接管返修（attempt 3）
+   - `DRAFT_PENDING_STATES`/`DRAFT_POLLABLE_STATES` 新增 `unconfirmed`：Pi 请求存在但 monitor 身份或结果暂不可读时，在原 taskId 上保持只读轮询，不停查、不重启、不换 taskId。
+   - `#advanceDrafts` 把 status=`unknown` 从“终止失败”改为转 `unconfirmed` 并记 `draft.unconfirmed`；同任务恢复到 `running` 时写回 `running` 并记 `draft.confirmed`；`completed` 仍走既有 sourceRev/CAS/决定快照保护。
+   - 重启接管 `starting` 记录时，status=`running` 接管为 `running`，status=`unknown` 接管为 `unconfirmed`；两条路径都沿用记录里的 promptRef/promptText，不重新渲染。
+   - `unconfirmed` 属在途：自动收集与显式 `requestDraft` 都返回原任务，不新建模型任务；`Candidate.blockedReason` 与 `runtime.activeDrafts` 暴露该状态。taskId 缺失/读取抛错仍记具体 `failed`，走既有显式重试语义。
+   - 未修改 PiAdapter，也未用固定 sleep 等待，状态全部来自实际 `pi.status` 返回值。
+   - 回归：新增 `整理进程状态暂未确认时保留同一 taskId 与只读核对，确认恢复后仍应用原结果`；与 attempt 2 的两个返修用例一起先红后绿。
 
 ## 验收对应
 
@@ -49,6 +58,7 @@
 | 升级后在途及重启沿用旧引用和文本，新请求用新版 | passed | 运行测试截取 v1 promptRef/promptText，升级 v2 并重启后仍以 v1 完成；显式新请求使用 v2 |
 | 缺失/非法模板不调用模型、明确阻塞、无硬编码回退 | passed | 缺失与 role 冲突均无 draft spawn、候选有 blockers、事件保留；修复后显式重试成功 |
 | 启动竞态：记录 starting 期间不轮询，Pi.start 返回后同一请求正常接管 | passed | 返修前用例确定性失败（`repair-start-race-red.log`），返修后通过（`repair-start-race-green.log`）；启动窗口中断的接管/缺失各有回归 |
+| 暂时 unknown 保留原引用继续只读核对，能接收其后 running/completed，不重复调用模型 | passed | 三条回归在 `425db49` 前确定性失败（`attempt3-red-before-fix.log`），修复后通过（`attempt3-green-after-fix.log`）；监督复现脚本从 recordState=unknown 永久停查变为 `unconfirmed` → `applied`（`attempt3-reviewer-repro.out` 与 `attempt3-reviewer-repro-after-commit.out`） |
 | 无工具、严格 JSON、sourceRev/CAS/决定快照与旧数据恢复保持有效 | passed | 既有专项回归 + 旧记录删除 promptRef/template/promptText 后仍保守恢复 |
 | 开发入口拒绝 draft 模板，前端只提供 worker 模板 | passed | `decide` 返回 400；`GET /api/state` 的 templates 仅 development:worker |
 | 既有回归与真实 Pi 隔离闭环实际通过，GitHub 替身分开报告 | passed | 见下 |
@@ -67,21 +77,45 @@
 | `npm run check:runtime` | passed | 隔离闭环 6/6；真实本地 Git 提交/推送/工作树回收，GitHub 使用明确替身，`repair-check-runtime.log` |
 | `npm run check:runtime:live` | passed | 真实 Pi 隔离闭环 6/6，`repair-runtime-live.log`；结果 `repair-runtime-live-result.json` |
 
-真实 Pi 证据（已从工作树复制到中央 `repair-pi-evidence/`，归档后仍可读取）：
+attempt 3 实际检查（修复 commit `425db49`，日志在中央 `attempt3/`）：
+
+| 命令 | 结果 | 说明 |
+| --- | --- | --- |
+| `node --test --test-name-pattern="暂未确认|暂时 unknown" test/runtime.test.mjs`（`2be87c8` 的 `src/runtime.mjs`） | failed | 3 条用例全部失败：原 taskId 永久停查、显式整理新建 taskId，`attempt3-red-before-fix.log` |
+| 同上（修复后 `src/runtime.mjs`） | passed | 3/3，`attempt3-green-after-fix.log` |
+| `npm test` | passed | 111/111（新增一条状态保持用例），`attempt3-npm-test.log` |
+| `node --test test/runtime.test.mjs` | passed | 27/27，`attempt3-runtime-test.log` |
+| `node --test test/external-adapters.test.mjs test/runtime-edges.test.mjs` | passed | 35/35，`attempt3-adapter-edges-test.log` |
+| `npm run check:trial` | passed | 35/35，`attempt3-check-trial.log` |
+| `npm run check:workflow` | passed | 18/18，`attempt3-check-workflow.log` |
+| `npm run check:runtime` | passed | 隔离闭环 6/6，GitHub 为替身、Git 为真实临时仓库，`attempt3-check-runtime-after-commit.log` |
+| `npm run check:runtime:live` | passed | 真实 Pi 隔离闭环 6/6，`attempt3-runtime-live-after-commit.log`；状态/结果 `attempt3-runtime-live/` |
+| `node attempt3/attempt3-reviewer-repro.mjs`（监督复现脚本，指向本工作树源码） | passed | `after_starting_recovery` 为 `unconfirmed`，Pi 稍后 completed 后为 `applied` 且 draft=recovered，`attempt3-reviewer-repro-after-commit.out`；未修改的监督原脚本输出（`t007-starting-unknown-repro.out`，recordState 永久 `unknown`）作为红基线保留 |
+
+attempt 3 真实 Pi 证据（已从工作树复制到中央 `attempt3/attempt3-runtime-live/`）：
+
+- `attempt3-runtime-live/state.json` 事件 `draft.started.data.promptRef = 425db49…:templates/requirements/1.0.0.md`，与修复 commit 一致。
+- `attempt3-runtime-live/pi-evidence/draft-7fc0338617a78ec0-1/prompt.md`：`role: draft` / `version: "1.0.0"` frontmatter，含“实质待决策”合同；`request.json` 为 role=`draft`、provider=`facaiai-deepseek`。
+- `attempt3-runtime-live/pi-evidence/run-baad3608-…`：role=`worker` 的真实隔离执行记录。
+- 两条 session 的 `model_change` 为 provider=`facaiai-deepseek`、modelId=`deepseek-flash`，`thinking_level_change` 为 `high`。
+
+真实 Pi 证据（attempt 2，已从工作树复制到中央 `repair-pi-evidence/`，归档后仍可读取）：
 
 - `repair-runtime-live-result.json`：`livePi:true`，6 项全部 passed，`temporaryRootRemoved:true`。
 - `repair-pi-evidence/draft-7fc0338617a78ec0-1/request.json`：role=`draft`，provider=`facaiai-deepseek`。
-- `repair-pi-evidence/draft-7fc0338617a78ec0-1/prompt.md`：带 `role: draft` / `version: "1.0.0"` frontmatter，包含“实质待决策”合同与不可信数据边界，说明实际使用 requirements 模板而非旧硬编码提示；对应事件 `draft.started.data.promptRef = 835e638…:templates/requirements/1.0.0.md`（`runtime-live/state.json`）。
-- `repair-pi-evidence/run-38b73f76-…`、`run-cbb106b1-…`：role=`worker`，同一次闭环内的真实执行记录。
-- 三条 session 逐项核对 `model_change` 与 `thinking_level_change`：provider=`facaiai-deepseek`、modelId=`deepseek-flash`、thinkingLevel=`high`，与固定配置一致。未修改凭据或全局配置。
+- `repair-pi-evidence/draft-7fc0338617a78ec0-1/prompt.md`：带 `role: draft` / `version: "1.0.0"` frontmatter，包含“实质待决策”合同与不可信数据边界，说明实际使用 requirements 模板而非旧硬编码提示；对应事件 `draft.started.data.promptRef = 835e638…:templates/requirements/1.0.0.md`（`repair-runtime-live-state.json`）。
+- `repair-pi-evidence/run-38b73f76-…`、`run-cbb106b1-…`：role=`worker`，来自两轮独立隔离检查的真实执行记录，不是同一次闭环的三条 session。
+- 上述三条 session 来自两轮独立隔离检查（非同一次闭环）；逐项核对 `model_change` 与 `thinking_level_change`：provider=`facaiai-deepseek`、modelId=`deepseek-flash`、thinkingLevel=`high`，与本轮 attempt 3 的两条 session 一致。未修改凭据或全局配置。
 
 ## GitHub 真实行为与替身边界
 
 - 本轮所有自动化检查中的 GitHub 行为均为隔离替身：不读取真实 Issue、不创建或合并真实 PR。
 - 真实 GitHub 侧使用 Issue `ag-jin/auto-ai#2` 派发本次任务；Issue 读取/建稿/决定由控制器完成，不在 Worker 检查内，Worker 也不合并 PR。
+- attempt 3 已把任务分支 `auto-ai/run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d` 推送到 `origin`（提交 `2be87c8` + `425db49` + 本次结果记录）；PR 创建/读回由 Runtime 负责，不在 Worker 内。
 - 未执行真实 GitHub 合并；最终用户验收与合并保持独立。
 
 ## 阻塞与未验证
 
 - blockers：无。
 - 未验证：真实 GitHub 侧的 PR 创建/读回/合并（Worker 不操作真实 Issue，也不合并 PR）；真实模型名与思考级别的逐项核验已在本文件记录，仍以监督者复核为准。
+- 已知边界：若任务在 `unconfirmed` 长期不可读（request 在但 monitor 与 result 都丢），该候选会一直保持原 taskId 的只读核对占用，既不自动改派也不新建模型任务；本轮未新增主动放弃/取消该任务的入口，需要人工或后续任务处理。

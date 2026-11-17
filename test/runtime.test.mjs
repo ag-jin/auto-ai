@@ -2034,6 +2034,60 @@ test('旧格式整理记录重开后保守恢复，保留当前用户决定并�
   await restarted.close();
 });
 
+test('中断在启动窗口的整理记录按同一 task id 接管，缺失时明确失败且不重调模型', async (t) => {
+  const { runtime, github, pi, workspace, dataDir } = await makeRuntime(t);
+  await configure(runtime);
+  await runtime.start();
+  github.setIssues(REPO, [issue(1), issue(2)]);
+  await runtime.collect();
+
+  const draftCalls = () => pi.startCalls.filter((call) => call.role === 'draft');
+  const adopted = draftCalls()[0];
+  const lost = draftCalls()[1];
+  await runtime.close();
+
+  // Reproduce a controller that stopped inside Pi.start: the record exists but
+  // the last owner never confirmed the monitor identity.
+  for (const call of [adopted, lost]) {
+    const file = draftRecordPath(dataDir, candidateId(call === adopted ? 1 : 2));
+    const record = JSON.parse(await readFile(file, 'utf8'));
+    record.state = 'starting';
+    record.endedAt = null;
+    await writeFile(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  }
+  pi.forget(lost.id);
+
+  const startsBefore = draftCalls().length;
+  const restarted = new Runtime({ dataDir, appRepoDir: APP_REPO, github, pi, workspace, tickMs: 10 });
+  runtimeDataDir.set(restarted, dataDir);
+  await restarted.start();
+  assert.equal(draftCalls().length, startsBefore, '启动窗口的接管不能重新调用模型');
+
+  // The adopted task keeps running under the same id and completes normally.
+  let state = await restarted.getState();
+  assert.ok(
+    state.events.some((event) => event.kind === 'draft.recovered' && event.data?.taskId === adopted.id),
+    '已存在的 Pi 任务被接管',
+  );
+  pi.complete(adopted.id, draftOutput({ goal: '启动窗口接管结果' }));
+  await restarted.tick();
+  state = await restarted.getState();
+  const recovered = state.candidates.find((item) => item.id === candidateId(1));
+  assert.equal(recovered.draft.goal, '启动窗口接管结果');
+
+  // A missing Pi task becomes a concrete blocker instead of a silent retry.
+  const missing = state.candidates.find((item) => item.id === candidateId(2));
+  assert.equal(missing.draft, null);
+  assert.match(missing.blockedReason ?? '', /启动中断/);
+  const missingRecord = JSON.parse(await readFile(draftRecordPath(dataDir, candidateId(2)), 'utf8'));
+  assert.equal(missingRecord.state, 'failed');
+
+  await restarted.collect();
+  await restarted.tick();
+  assert.equal(draftCalls().length, startsBefore, '同源启动失败不自动重试');
+  await restarted.close();
+});
+
 test('全局仅一个槽位时，准备失败释放占用并继续安排另一仓库', async (t) => {
   const { runtime, github, pi, workspace } = await makeRuntime(t, { tickMs: 60000 });
   try {

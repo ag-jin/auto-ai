@@ -34,6 +34,11 @@ const AUTO_DRAFT_SKIP_STATES = new Set([
 // A failed or unknown draft for the same source revision is only retried when
 // the user explicitly asks again.
 const AUTO_DRAFT_BLOCKING_STATES = new Set(['failed', 'unknown']);
+// Draft records that own a Pi request or the start window leading to one.
+const DRAFT_PENDING_STATES = new Set(['starting', 'running']);
+// Only a draft whose Pi.start has returned owns a pollable monitor identity;
+// polling during `starting` would report a false `unknown`.
+const DRAFT_POLLABLE_STATES = new Set(['running']);
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
@@ -669,7 +674,7 @@ export class Runtime {
 
     const record = await this.#withDraftRecord(id, async (current) => {
       if (this.#closing) throw httpError(503, 'runtime_closing', '工作台正在停止');
-      if (current && current.state === 'running') {
+      if (current && DRAFT_PENDING_STATES.has(current.state)) {
         return { existing: current };
       }
       const attempts = (current?.attempts ?? 0) + 1;
@@ -682,7 +687,11 @@ export class Runtime {
         // Persist the user intent this draft is based on. Any later decision
         // wins over this asynchronously produced result.
         decisionSnapshot: decisionFingerprint(candidate.decision),
-        state: 'running',
+        // `starting` covers the window where the record exists but Pi.start has
+        // not returned yet. Polling Pi.status during that window reports
+        // `unknown` (the monitor identity is not recorded), which would strand
+        // a draft that actually succeeds.
+        state: 'starting',
         startedAt: now(),
         endedAt: null,
         error: null,
@@ -736,6 +745,10 @@ export class Runtime {
 
       try {
         await this.#pi.start({ id: taskId, cwd: this.#appRepoDir, prompt, role: 'draft' });
+        // Only now may tick poll the task: the Pi request, monitor identity and
+        // result paths exist. Keep the same task id for start and supervision.
+        next.state = 'running';
+        writeJsonAtomic(this.#draftRecordFile(id), next);
       } catch (error) {
         next.state = 'failed';
         next.endedAt = now();
@@ -812,7 +825,7 @@ export class Runtime {
   #activeDraftIds() {
     const ids = new Set(this.#drafts.keys());
     for (const record of this.#draftRecords()) {
-      if (record.state === 'running') {
+      if (DRAFT_PENDING_STATES.has(record.state)) {
         ids.add(record.candidateId);
       }
     }
@@ -1523,7 +1536,7 @@ export class Runtime {
   async #advanceDrafts() {
     const workflow = this.#wf;
     for (const record of this.#draftRecords()) {
-      if (record.state !== 'running') {
+      if (!DRAFT_POLLABLE_STATES.has(record.state)) {
         continue;
       }
       let status;
@@ -1698,7 +1711,11 @@ export class Runtime {
 
   async #recoverDrafts() {
     for (const record of this.#draftRecords()) {
-      if (record.state !== 'running') {
+      if (record.state === 'starting') {
+        await this.#recoverStartingDraft(record);
+        continue;
+      }
+      if (!DRAFT_PENDING_STATES.has(record.state)) {
         continue;
       }
       this.#drafts.set(record.candidateId, {
@@ -1708,6 +1725,48 @@ export class Runtime {
       });
     }
     await this.#advanceDrafts();
+  }
+
+  /**
+   * A `starting` record means the previous owner stopped inside Pi.start. The
+   * start may or may not have happened, so the same task id is checked instead
+   * of guessing: an existing Pi task is adopted as-is and a missing one becomes
+   * a concrete failure. Neither path silently starts a second model call.
+   */
+  async #recoverStartingDraft(record) {
+    const workflow = this.#wf;
+    let status;
+    try {
+      if (typeof record.taskId !== 'string' || record.taskId.length === 0) {
+        throw new Error('记录缺少 taskId');
+      }
+      status = await this.#pi.status(record.taskId);
+    } catch (error) {
+      record.state = 'failed';
+      record.endedAt = now();
+      record.error = `整理启动中断，未找到可接管的 Pi 任务：${errorMessage(error)}`;
+      writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
+      this.#drafts.delete(record.candidateId);
+      workflow.recordEvent({
+        kind: 'draft.failed',
+        message: `候选 ${record.candidateId} 的只读整理启动中断：${record.error}`,
+        candidateId: record.candidateId,
+      });
+      return;
+    }
+    record.state = 'running';
+    writeJsonAtomic(this.#draftRecordFile(record.candidateId), record);
+    this.#drafts.set(record.candidateId, {
+      taskId: record.taskId,
+      sourceRev: record.sourceRev,
+      draftRev: record.draftRev,
+    });
+    workflow.recordEvent({
+      kind: 'draft.recovered',
+      message: `候选 ${record.candidateId} 的只读整理在启动窗口中断后接管（${record.taskId}）`,
+      candidateId: record.candidateId,
+      data: { taskId: record.taskId, promptRef: record.promptRef ?? null },
+    });
   }
 
   // ---------------------------------------------------------------------

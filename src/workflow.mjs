@@ -1475,13 +1475,14 @@ export class Workflow {
   // Events
   // ---------------------------------------------------------------------
 
-  listEvents({ after = 0, limit = 200, candidateId, runId, repo } = {}) {
+  listEvents({ after = 0, limit = 200, candidateId, runId, repo, order = 'asc' } = {}) {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new Error('after 必须是非负整数');
     }
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error('limit 必须是正整数');
     }
+    if (order !== 'asc' && order !== 'desc') throw new Error('order 只能是 asc 或 desc');
     const conditions = ['id > ?'];
     const params = [after];
     if (candidateId !== undefined) {
@@ -1498,7 +1499,7 @@ export class Workflow {
     }
     params.push(limit);
     const rows = this.#store.all(
-      `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY id ASC LIMIT ?`,
+      `SELECT * FROM events WHERE ${conditions.join(' AND ')} ORDER BY id ${order.toUpperCase()} LIMIT ?`,
       ...params,
     );
     return rows.map(eventFromRow);

@@ -20,4 +20,17 @@
 - 在 core.recordMerged 完成后、intent 写成 merged 前中断，重启读回能从持久结果恢复 merge SHA，不能 completed 却永远返回 pending。
 - preparing 记录重启后继续幂等 workspace.create/准备 packet，准备齐全后才绑定并 spawn；有既存 manifest 时复用同一工作树。至少覆盖创建前和创建后、prepared 记录写入前的中断，不能留下无人关联的工作树或误入 blocked。
 
-只改 src/runtime*.mjs、test/runtime.test.mjs、docs/worker-trials/T005A-result.md；保留原授权、独立 Worker、scope 与恢复功能。先复现再修复，专项及全量检查实际跑。主会话负责提交，不修改 HTTP/UI 或合同，不真实合并 PR。
+## 首轮尚未通过的四项检查
+
+主会话 `node --test test/runtime.test.mjs` 实跑 8/12，完整输出 `.auto-ai/validation/T005A/current-runtime.log`。原任务所有验收继续有效，本轮要完成 T005A，不能只修上面的三处。
+
+- 旧整理覆盖：当前测试只调用 FakeGitHub.overrideIssue（影响 readIssue）但 collectIssues 的列表可能仍旧。让 fixture 对真实观测行为一致，明确用更新后的 collect 列表或交付前只读刷新；sourceRev 改变后旧稿须 discarded，用户手工稿 CAS 也不能被覆盖。
+- 并发测试期望三次 draft.start，实际两次：核对 OTHER_REPO 是否在已配置仓库和规则范围，以及 fake 收集条目是否绑定正确仓库。修正确实错误的 fixture，不要放松串仓/规则检查。以真实合同的并发/依赖/冲突行为验收。
+- unknown 后确认 failed，Run 已 blocked，retry 却因 control.spawn 仍标 unknown 被拒绝。确认终止后同步持久终态；仍 unknown 时继续保留占用。
+- 旧测试把 Issue 改内容、使授权失效后，仅恢复原文就预期能合并。这个预期违反“源内容改变清除开发授权”。保留失效事实，正向合并应使用独立的有效任务或重新授权后的新产物与验收；不得因正文恢复而恢复旧授权/验收。
+
+## 执行范围与回报
+
+允许 src/runtime*.mjs、src/workflow.mjs、src/store.mjs、src/github-adapter.mjs、test/runtime.test.mjs、docs/worker-trials/T005A-result.md；仅在必要时改领域方法，保持既有 API 兼容。已有代码已经存在，按失败函数定位阅读，避免重复改写整个 Runtime。当前主体、原任务稿和合同是事实来源。
+
+原运行由主会话确认取消后保存检查点，再派本返修，不是已完成。先跑已知失败项与独立脚本，再修复。必须专项和全量都实际通过，并说明真实外部未验证项。补最终结果文档。主会话负责提交，不修改 HTTP/UI、WorkspaceAdapter、合同或真实 PR，不真实合并。

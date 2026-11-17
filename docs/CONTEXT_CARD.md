@@ -41,4 +41,6 @@ Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录
 
 用户已明确回复“批准 T007 v1，用现有系统执行”，批准回执见 `docs/worker-trials/T007-approval.md`。固定 rev=`10fb0c71586487f4b96ed8ce01f3e1d505962474eef697b9516f7dff130e75c5`；`T007-proposed-draft.json` 保留原提案快照，不改写其中历史 authorized=false。
 
-经当前工作台创建/复用真实 GitHub Issue，保存精确稿并核对 rev、记录这次真实用户开发决定，让 Runtime 自动安排 Pi 实现。先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准包括创建 Issue、实施和提交 PR，不包括最终用户验收或合并；PR #1 仍待最终验收。
+真实 Issue `ag-jin/auto-ai#2` 已被当前工作台收集；Pi 只读整理完成后，按 CAS 保存批准的精确内容，draft_rev 与 requirements_rev 均匹配，再记录 develop。自动整理稿占持久版本 1，批准内容保存为持久版本 2；批准对应的内容 rev 不变。Runtime 已自动启动 `run-01a73750-61af-414e-9407-d286c7b03af4`，开发模板固定 `d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`。
+
+监督这次真实执行、独立复跑检查并核验 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准包括创建 Issue、实施和提交 PR，不包括最终用户验收或合并；PR #1 仍待最终验收。

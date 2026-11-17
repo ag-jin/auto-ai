@@ -9,7 +9,7 @@
 - template_ref：`d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`
 - requirements_rev：`sha256:a0ef7b417f1dee351d7c06e2fb87cd15ab22417ddfca5eb2c9ea6458fb5acb4d`
 - 开工基线：`d5993e3`；任务分支：`auto-ai/run-a5500446-44b8-4b27-9238-6b844132e932`
-- 首轮提交：`80b3447`、`b762697`；返修回红：`835e638`；返修提交：见本分支后续 commit
+- 首轮提交：`80b3447`、`b762697`；返修回红：`835e638`；返修修复：`84e2bec`；结果记录更新紧随其后
 - 任务稿：`docs/worker-trials/T007-task.md` v1（用户已批准，见 `T007-approval.md`）
 
 ## 交付内容

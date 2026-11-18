@@ -1350,6 +1350,137 @@ export class Workflow {
     });
   }
 
+  /**
+   * Binds the still-pending acceptance of one Run/PR to a newer, externally
+   * verified head. The caller must already have checked the real PR head, the
+   * Issue source revision, the fast-forward ancestry and the committed write
+   * scopes. Only `result.pr.headSha` changes; earlier acceptances, the
+   * development decision, the candidate and the other result fields stay as
+   * they are, so the old approval is kept but no longer satisfies canMerge.
+   */
+  registerDeliveryHead(runId, input) {
+    if (!isObject(input)) {
+      throw new Error('登记信息必须是对象');
+    }
+    const fromHeadSha = requireTrimmedString(input.fromHeadSha, 'fromHeadSha');
+    const toHeadSha = requireTrimmedString(input.toHeadSha, 'toHeadSha');
+    for (const [name, value] of [['fromHeadSha', fromHeadSha], ['toHeadSha', toHeadSha]]) {
+      if (!COMMIT_PATTERN.test(value)) {
+        throw new Error(`${name} 必须是完整的 40 或 64 位十六进制提交 SHA`);
+      }
+    }
+    if (fromHeadSha.toLowerCase() === toHeadSha.toLowerCase()) {
+      throw new Error('新 head 必须与已登记 head 不同');
+    }
+    const evidence = input.evidence;
+    if (!isObject(evidence)) {
+      throw new Error('evidence 必须是对象');
+    }
+    const evidenceSha256 = requireTrimmedString(evidence.sha256, 'evidence.sha256').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(evidenceSha256)) {
+      throw new Error('evidence.sha256 必须是 64 位十六进制摘要');
+    }
+    const evidenceSummary = requireTrimmedString(evidence.summary, 'evidence.summary');
+    const prInput = input.pr;
+    if (!isObject(prInput)) {
+      throw new Error('pr 必须是对象');
+    }
+    const prRepo = requireTrimmedString(prInput.repo, 'pr.repo');
+    if (!Number.isSafeInteger(prInput.number) || prInput.number < 1) {
+      throw new Error('pr.number 必须是正整数');
+    }
+    const prUrl = requireTrimmedString(prInput.url, 'pr.url');
+
+    return this.#store.transaction(() => {
+      const run = this.#requireRunRow(runId);
+      const candidate = candidateFromRow(this.#requireCandidateRow(run.candidate_id));
+      if (prRepo.toLowerCase() !== run.repo.toLowerCase()) {
+        throw new Error('pr.repo 必须与 Run 的仓库一致');
+      }
+      if (!hasValidDevelopDecision(candidate)) {
+        throw new Error(`Run ${runId} 的开发授权已失效，不能登记新 head`);
+      }
+      if (candidate.state !== 'awaiting_acceptance' || run.status !== 'awaiting_acceptance') {
+        throw new Error(
+          `Run ${runId} 当前不在待验收状态（候选 ${candidate.state}、Run ${run.status}），不能登记新 head`,
+        );
+      }
+      const current = this.#currentRunRow(candidate.id);
+      if (!current || current.id !== run.id) {
+        throw new Error(`Run ${runId} 不是候选 ${candidate.id} 的最新执行，不能登记新 head`);
+      }
+      if (candidate.activeRunId) {
+        throw new Error(`候选 ${candidate.id} 仍有活动执行 ${candidate.activeRunId}，不能登记新 head`);
+      }
+      const running = this.#store.get(
+        "SELECT id FROM runs WHERE candidate_id = ? AND status = 'running' LIMIT 1",
+        candidate.id,
+      );
+      if (running) {
+        throw new Error(`候选 ${candidate.id} 仍有执行中的 Run ${running.id}，不能登记新 head`);
+      }
+      if (
+        !candidate.draft ||
+        run.draft_rev !== candidate.draft.rev ||
+        run.requirements_rev !== candidate.draft.requirementsRev ||
+        run.source_rev !== candidate.sourceRev
+      ) {
+        throw new Error(`Run ${runId} 对应旧版本任务稿或旧源内容，不能登记新 head`);
+      }
+      const result = run.result ? JSON.parse(run.result) : null;
+      const pr = result?.pr ?? null;
+      if (!isObject(pr)) {
+        throw new Error(`Run ${runId} 的结果没有 PR，不能登记新 head`);
+      }
+      if (
+        pr.repo.toLowerCase() !== prRepo.toLowerCase() ||
+        pr.number !== prInput.number ||
+        pr.url !== prUrl
+      ) {
+        throw new Error('待登记的 PR 仓库、编号或地址与 Run 结果不一致，拒绝换 PR 登记');
+      }
+      if (pr.headSha.toLowerCase() !== fromHeadSha.toLowerCase()) {
+        throw new Error(
+          `Run ${runId} 已登记的 PR head 为 ${pr.headSha}，与 fromHeadSha ${fromHeadSha} 不一致，拒绝登记`,
+        );
+      }
+
+      const at = now();
+      const updatedResult = { ...result, pr: { ...pr, headSha: toHeadSha } };
+      this.#store.run(
+        'UPDATE runs SET result = ?, updated_at = ? WHERE id = ?',
+        JSON.stringify(updatedResult),
+        at,
+        runId,
+      );
+      this.#store.appendEvent({
+        at,
+        kind: 'run.head_registered',
+        message:
+          `Run ${runId} 的 PR #${pr.number} 已从 ${pr.headSha.slice(0, 12)} 登记到新 head ` +
+          `${toHeadSha.slice(0, 12)}；需按新 head 重新验收，旧验收保留但不再生效`,
+        candidateId: candidate.id,
+        runId,
+        repo: run.repo,
+        data: {
+          fromHeadSha: pr.headSha,
+          toHeadSha,
+          pr: { repo: pr.repo, number: pr.number, url: pr.url },
+          evidence: { sha256: evidenceSha256, summary: evidenceSummary },
+        },
+      });
+      return {
+        runId,
+        candidateId: candidate.id,
+        pr: updatedResult.pr,
+        fromHeadSha: pr.headSha,
+        toHeadSha,
+        evidence: { sha256: evidenceSha256, summary: evidenceSummary },
+        at,
+      };
+    });
+  }
+
   canMerge(id, { headSha } = {}) {
     const candidate = candidateFromRow(this.#requireCandidateRow(id));
     const reasons = [];

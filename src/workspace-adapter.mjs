@@ -17,6 +17,23 @@ const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const MAX_BUFFER = 16 * 1024 * 1024;
 const MAX_CHANGED_PATHS = 2000;
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
+// Verification commands must never reach the remote or write objects: a partial
+// clone would otherwise lazily fetch a missing commit and silently change what
+// "local objects" means. GIT_ALLOW_PROTOCOL denies every transport (Git 2.39
+// still starts the lazy fetch helper, which then refuses at protocol choice),
+// while GIT_NO_LAZY_FETCH disables fetching earlier on newer Git versions.
+const LOCAL_OBJECTS_ONLY_GIT_ENV = Object.freeze({
+  GIT_ALLOW_PROTOCOL: '',
+  GIT_NO_LAZY_FETCH: '1',
+  GIT_TERMINAL_PROMPT: '0',
+});
+
+function localObjectsOnlyRunOptions() {
+  return {
+    maxBuffer: MAX_BUFFER,
+    env: { ...process.env, ...LOCAL_OBJECTS_ONLY_GIT_ENV },
+  };
+}
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -277,9 +294,10 @@ export class WorkspaceAdapter {
     return path.join(this.#rootDir, 'worktrees');
   }
 
-  async #git(repoPath, args, action) {
+  async #git(repoPath, args, action, { localOnly = false } = {}) {
     try {
-      return await this.#run('git', ['-C', repoPath, ...args], { maxBuffer: MAX_BUFFER });
+      const options = localOnly ? localObjectsOnlyRunOptions() : { maxBuffer: MAX_BUFFER };
+      return await this.#run('git', ['-C', repoPath, ...args], options);
     } catch (error) {
       throw new Error(describeFailure(action, error));
     }
@@ -290,6 +308,23 @@ export class WorkspaceAdapter {
       return await this.#run('git', ['-C', repoPath, ...args], { maxBuffer: MAX_BUFFER });
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Runs a read-only Git command with lazy fetching disabled and returns its
+   * exit status instead of throwing on a non-zero one. Only a missing process
+   * exit status is treated as an unexpected error.
+   */
+  async #localGitStatus(repoPath, args, action) {
+    try {
+      const result = await this.#run('git', ['-C', repoPath, ...args], localObjectsOnlyRunOptions());
+      return { status: 0, stdout: result.stdout, stderr: result.stderr };
+    } catch (error) {
+      if (!Number.isInteger(error?.code)) {
+        throw new Error(describeFailure(action, error));
+      }
+      return { status: error.code, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
     }
   }
 
@@ -756,22 +791,45 @@ export class WorkspaceAdapter {
     return parseLsRemote(result.stdout);
   }
 
-  async #assertDeliveryScopes(context, scopes, snapshot) {
-    // A Worker may have committed before handing control back. Validate every
-    // commit that would be published, including paths later reverted.
-    const history = await this.#git(context.targetPath,
-      ['rev-list', '--max-count=2001', `${context.targetBase}..${snapshot.headSha}`],
-      '检查待发布的任务提交');
+  /**
+   * Collects every path touched by commits in `baseCommit..headSha`. The union
+   * includes paths that a later commit reverts, because publishing the branch
+   * still carries those commits. Read-only: no fetch, checkout, worktree or
+   * manifest is required, so it also serves the head-registration check.
+   */
+  async #committedPaths(repoPath, baseCommit, headSha, { localOnly = false } = {}) {
+    const git = (args, action) => this.#git(repoPath, args, action, { localOnly });
+    const history = await git(
+      ['rev-list', '--max-count=2001', `${baseCommit}..${headSha}`],
+      '检查待发布的任务提交',
+    );
     const commits = history.stdout.trim().split('\n').filter(Boolean);
-    if (commits.length > 2000) throw new Error('任务提交数超过 2000，保留现场并拒绝推送');
-    const paths = new Set(snapshot.paths);
+    const paths = new Set();
+    if (commits.length > 2000) {
+      return { commits, paths, tooManyCommits: true };
+    }
     for (const commit of commits) {
-      const changed = await this.#git(context.targetPath,
+      const changed = await git(
         ['diff-tree', '-m', '--root', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', commit],
-        '检查已提交的写入范围');
+        '检查已提交的写入范围',
+      );
       for (const file of changed.stdout.split('\0').filter(Boolean)) paths.add(file);
       if (paths.size > MAX_CHANGED_PATHS) break;
     }
+    return { commits, paths, tooManyCommits: false };
+  }
+
+  async #assertDeliveryScopes(context, scopes, snapshot) {
+    // A Worker may have committed before handing control back. Validate every
+    // commit that would be published, including paths later reverted.
+    const { paths: committed, tooManyCommits } = await this.#committedPaths(
+      context.targetPath,
+      context.targetBase,
+      snapshot.headSha,
+    );
+    if (tooManyCommits) throw new Error('任务提交数超过 2000，保留现场并拒绝推送');
+    const paths = new Set(snapshot.paths);
+    for (const file of committed) paths.add(file);
     if (paths.size > MAX_CHANGED_PATHS) {
       throw new Error(`变更文件数超过上限 ${MAX_CHANGED_PATHS}，拒绝提交异常大变更`);
     }
@@ -929,6 +987,98 @@ export class WorkspaceAdapter {
       paths: before.paths,
       pushed: true,
       noChanges: false,
+    };
+  }
+
+  /**
+   * Read-only proof that `headSha` is a fast-forward of `baseCommit` inside the
+   * local clone of `repo`, and that every committed path stays inside
+   * `writeScopes`. Used to bind an already-delivered PR to a newer head without
+   * fetching, checking out or touching the remote.
+   */
+  async verifyCommittedRange({ repo, localPath, baseCommit, headSha, writeScopes } = {}) {
+    const targetRepo = requireRepo(repo);
+    const sourcePath = requireAbsolutePath(localPath, 'localPath');
+    const base = requireCommit(baseCommit, 'baseCommit');
+    const head = requireCommit(headSha, 'headSha');
+    const scopes = normalizeWriteScopes(writeScopes);
+    if (base.toLowerCase() === head.toLowerCase()) {
+      throw new Error('baseCommit 与 headSha 必须是两个不同的完整提交 SHA');
+    }
+
+    const localReal = await this.#assertSourceIdentity(targetRepo, sourcePath);
+    // A shallow clone cannot prove that `base..head` contains every published
+    // commit: rev-list silently stops at the shallow boundary and can miss an
+    // out-of-scope path that a later commit reverted. Refuse before reading
+    // objects instead of treating truncated history as evidence. No automatic
+    // fetch: an operator must prepare a full history first.
+    const shallow = await this.#git(
+      localReal,
+      ['rev-parse', '--is-shallow-repository'],
+      '检查本地仓库是否为浅克隆',
+      { localOnly: true },
+    );
+    if (shallow.stdout.trim() === 'true') {
+      throw new Error(
+        `本地仓库 ${localReal} 是浅克隆，提交历史被截断，无法核对 ${base}..${head} 的完整范围；`
+        + '请先由操作员补齐完整历史（本命令不会自动 fetch），拒绝登记',
+      );
+    }
+    for (const [label, sha] of [['baseCommit', base], ['headSha', head]]) {
+      const probe = await this.#localGitStatus(
+        localReal,
+        ['cat-file', '-e', `${sha}^{commit}`],
+        `核对 ${label} ${sha} 是否已在本地仓库`,
+      );
+      if (probe.status === 0) continue;
+      // Never guess a missing object from Git's English wording: any failure
+      // here fails closed, and the actual Git error is kept for the operator.
+      const detail = String(probe.stderr ?? '').trim();
+      throw new Error(
+        `${label} ${sha} 不在本地仓库中或无法读取（git cat-file 退出码 ${probe.status}），`
+        + `拒绝按未获取的提交登记${detail ? `：${detail}` : ''}`,
+      );
+    }
+    const ancestor = await this.#localGitStatus(
+      localReal,
+      ['merge-base', '--is-ancestor', base, head],
+      '核对 baseCommit 是否为 headSha 的祖先',
+    );
+    if (ancestor.status === 1) {
+      throw new Error(`baseCommit ${base} 不是 headSha ${head} 的祖先，拒绝登记非快进变更`);
+    }
+    if (ancestor.status !== 0) {
+      throw new Error(
+        describeFailure('核对 baseCommit 是否为 headSha 的祖先', {
+          stderr: ancestor.stderr,
+          message: `git merge-base 退出码 ${ancestor.status}`,
+        }),
+      );
+    }
+
+    const { commits, paths: committed, tooManyCommits } = await this.#committedPaths(
+      localReal,
+      base,
+      head,
+      { localOnly: true },
+    );
+    if (tooManyCommits || committed.size > MAX_CHANGED_PATHS) {
+      throw new Error(`提交或变更文件数超过上限（${commits.length} 个提交、${committed.size} 个路径），拒绝登记`);
+    }
+    const outside = [...committed].filter((file) => !pathMatchesScopes(file, scopes));
+    if (outside.length > 0) {
+      throw new Error(
+        `变更超出 writeScopes（${scopes.join('、')}）：${outside.slice(0, 20).join('、')}`,
+      );
+    }
+
+    return {
+      repo: targetRepo,
+      localPath: localReal,
+      baseCommit: base,
+      headSha: head,
+      commits: commits.length,
+      paths: [...committed].sort(),
     };
   }
 

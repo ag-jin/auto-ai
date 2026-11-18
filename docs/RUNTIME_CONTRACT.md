@@ -52,3 +52,16 @@ Candidate.draft.rev 是 Workflow 当前的裸 SHA，requirementsRev 是 `sha256:
 需求整理、后台 tick、两种验收都不能发合并。只有 merge 方法收到 confirmed=true、当前双角色批准、expectedHeadSha 与实际一致才可发送。用户当前未配置额外监督线程，设计监督在主会话核验后由本地界面记录实际结论，不能伪造角色审批。
 
 发送前持久 merge intent（repo/PR/head/method）。只发送一次；超时、异常、pending、重启均只通过 readPullRequest 核验。MERGED + 有效完整 merge SHA + 同 head 才 recordMerged。再次 merge 请求遇到 intent 时只读核对，不重复发送命令；读回 OPEN 也保持 pending 并解释。HTTP/UI 展示 pending，不能冒充完成。
+
+当合法返修已追加到原 PR、当前结果仍记录旧 head 时，`recordAcceptance`/`merge` 按已登记 head 对比远端而拒绝新 head，这是预期的保护，不放宽。需要维护时使用显式本地命令（不新增 HTTP/UI 入口）：
+
+```bash
+node scripts/register-pr-head.mjs --data-dir <已有数据目录> --run-id <id> \
+  --from <旧完整SHA> --to <新完整SHA> --evidence <JSON文件> --confirm
+# 证据 JSON：{"headSha":"<新完整SHA>","summary":"<独立验收结果及原始证据引用>"}
+```
+
+- 只读核对后，把等待验收的同一 Run 的同一 PR 绑定到新 head：校验实时 PR 同 repo/number/open 且 head 正好是 `--to`、Issue 源版本等于 Run sourceRev、`--from` 是 `--to` 的祖先、追加提交（含后来撤销的路径）不超出 Run 固定任务稿的 writeScopes。旧 SHA 不是已登记 head、证据 headSha 不匹配、范围越界、存在合并意图或控制器锁被占用时一律拒绝，不写任何记录。
+- Git 核对子进程禁用惰性取回（`GIT_ALLOW_PROTOCOL=''`、`GIT_NO_LAZY_FETCH=1`），只使用本地已有对象：partial clone 缺少 `--to` 等对象时直接拒绝，不接触远程、不写 pack/promisor；已有全部所需对象时仍正常登记。本地仓库必须是完整历史（`rev-parse --is-shallow-repository` 为 false）；浅克隆会被拒绝，操作员需先自行补齐完整历史，命令不自动 fetch。
+- 单事务只改 `result.pr.headSha` 与 `updated_at`，并追加一条 `run.head_registered` 审计事件（旧/新 SHA、Run/PR、证据字节 sha256 与摘要）。Worker 原始证据、历史 acceptances、开发授权与候选状态不变。
+- 命令不启动 Runtime/调度器，不调用模型，不 fetch/checkout/推送、不建 PR、不合并，也不自动判定验收；新 head 必须按现有验收接口重新双角色验收后才能 `canMerge`，旧批准保留但不再生效。重复用旧 SHA 调用会被拒绝且不重复追加事件。

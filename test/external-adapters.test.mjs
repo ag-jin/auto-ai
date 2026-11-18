@@ -1090,8 +1090,9 @@ test('Workspace archive 对未推送工作树保留现场', async (t) => {
 // Template adapter
 // ---------------------------------------------------------------------------
 
-function templateText(id, version, body) {
-  return `---\nschema_version: 1\nid: ${id}\nversion: "${version}"\n---\n\n${body}\n`;
+function templateText(id, version, body, role) {
+  const roleLine = role ? `role: ${role}\n` : '';
+  return `---\nschema_version: 1\nid: ${id}\nversion: "${version}"\n${roleLine}---\n\n${body}\n`;
 }
 
 const VALID_CATALOG = `schema_version: 1
@@ -1258,4 +1259,268 @@ templates:
     () => resolveTemplate({ repoDir: wrongTemplateId.repo, id: 'development' }),
     /与 catalog 的 development 不一致/,
   );
+});
+
+test('roles: requirements 必须为 draft，旧 worker 模板默认为 worker，role 与入口一致', async (t) => {
+  const catalog = `schema_version: 1
+templates:
+  development:
+    description: 开发
+    default: development/1.2.0.md
+  research:
+    description: 调研
+    default: research/1.0.0.md
+  requirements:
+    description: 只读整理
+    role: draft
+    default: requirements/1.0.0.md
+`;
+  const files = {
+    'templates/development/1.2.0.md': templateText('development', '1.2.0', '# 开发'),
+    'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+    'templates/requirements/1.0.0.md': templateText(
+      'requirements',
+      '1.0.0',
+      '# 只读整理\n不能执行命令',
+      'draft',
+    ),
+  };
+  const { repo, commit } = await makeTemplateRepo(t, { catalog, files });
+
+  // Templates without a role stay compatible as worker templates.
+  const worker = await resolveTemplate({ repoDir: repo, id: 'development', expectedRole: 'worker' });
+  assert.equal(worker.role, 'worker');
+  const draft = await resolveTemplate({
+    repoDir: repo,
+    id: 'requirements',
+    expectedRole: 'draft',
+  });
+  assert.equal(draft.role, 'draft');
+  assert.equal(draft.templateRef, `${commit}:templates/requirements/1.0.0.md`);
+  assert.match(draft.text, /不能执行命令/);
+
+  const all = await listTemplates({ repoDir: repo, ref: 'HEAD' });
+  assert.deepEqual(
+    all.map((item) => `${item.id}@${item.version}:${item.role}`),
+    ['development@1.2.0:worker', 'requirements@1.0.0:draft', 'research@1.0.0:worker'],
+  );
+  const workerOnly = await listTemplates({ repoDir: repo, ref: 'HEAD', role: 'worker' });
+  assert.deepEqual(workerOnly.map((item) => item.id), ['development', 'research']);
+  const draftOnly = await listTemplates({ repoDir: repo, ref: 'HEAD', role: 'draft' });
+  assert.deepEqual(draftOnly.map((item) => item.id), ['requirements']);
+
+  // A worker entry cannot be used for the read-only draft role and vice versa.
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo, id: 'development', expectedRole: 'draft' }),
+    /不能作为 draft 模板/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo, id: 'requirements', expectedRole: 'worker' }),
+    /不能作为 worker 模板/,
+  );
+});
+
+test('roles: 非法 role、catalog 与模板 role 不一致都拒绝', async (t) => {
+  const invalidRole = await makeTemplateRepo(t, {
+    files: {
+      'templates/development/1.0.0.md': templateText(
+        'development',
+        '1.0.0',
+        '# 非法',
+        'admin',
+      ),
+      'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+    },
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: invalidRole.repo, id: 'development' }),
+    /role 必须是 worker 或 draft/,
+  );
+
+  const catalogMismatch = await makeTemplateRepo(t, {
+    catalog: `schema_version: 1
+templates:
+  development:
+    description: role 冲突
+    role: draft
+    default: development/1.0.0.md
+`,
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: catalogMismatch.repo, id: 'development' }),
+    /catalog role draft 与模板 role worker 不一致/,
+  );
+
+  const invalidCatalogRole = await makeTemplateRepo(t, {
+    catalog: `schema_version: 1
+templates:
+  development:
+    description: role 非法
+    role: tools
+    default: development/1.0.0.md
+`,
+  });
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: invalidCatalogRole.repo, id: 'development' }),
+    /catalog role 必须是 worker 或 draft/,
+  );
+});
+
+test('roles: 保留 ID requirements 不能被改成 worker，列表按条目隔离坏条目', async (t) => {
+  const catalog = `schema_version: 1
+templates:
+  development:
+    description: 开发
+    default: development/1.0.0.md
+  research:
+    description: 调研
+    default: research/1.0.0.md
+  requirements:
+    description: 被改写的整理
+    role: worker
+    default: requirements/1.0.0.md
+  broken:
+    description: 缺失文件
+    default: broken/1.0.0.md
+  baddefault:
+    description: 非法路径
+    default: ../evil.md
+`;
+  const repo = await makeTemplateRepo(t, {
+    catalog,
+    files: {
+      'templates/development/1.0.0.md': templateText('development', '1.0.0', '# 开发'),
+      'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+      'templates/requirements/1.0.0.md': templateText(
+        'requirements',
+        '1.0.0',
+        '# 被改写的整理',
+        'worker',
+      ),
+    },
+  });
+
+  // A relabelled reserved ID is invalid content, not a worker template.
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'requirements' }),
+    /保留 ID 的 role 必须为 draft/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'requirements', expectedRole: 'worker' }),
+    /保留 ID 的 role 必须为 draft/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'broken' }),
+    /broken\/1\.0\.0\.md 在提交 .* 中读取失败/,
+  );
+
+  // Compatibility: the generic list stays strict, so existing callers and the
+  // T003B contract keep surfacing invalid metadata as an error. The first
+  // sorted entry `baddefault` has the illegal `../evil.md` path.
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD', role: 'worker' }),
+    /模板 baddefault 的 catalog default 不能包含空、\. 或 \.\. 路径段/,
+  );
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD' }),
+    /模板 baddefault 的 catalog default 不能包含空、\. 或 \.\. 路径段/,
+  );
+
+  // Only the workbench development list opts into per-entry isolation: one
+  // broken entry must not clear the other valid worker templates.
+  const workerOnly = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    role: 'worker',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(workerOnly.map((item) => item.id), ['development', 'research']);
+  const isolatedAll = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(
+    isolatedAll.map((item) => `${item.id}:${item.role}`),
+    ['development:worker', 'research:worker'],
+  );
+});
+
+test('容错枚举只吸收条目级配置错误，catalog 与对象读取故障整体失败', async (t) => {
+  // An unparseable catalog is a source fault: no mode may report it as an empty
+  // or partial template list.
+  const badCatalog = await makeTemplateRepo(t, {
+    catalog: 'schema_version: 1\ntemplates: [\n',
+  });
+  for (const skipInvalidEntries of [false, true]) {
+    await assert.rejects(
+      () => listTemplates({ repoDir: badCatalog.repo, ref: 'HEAD', skipInvalidEntries }),
+      /catalog.*YAML|YAML.*catalog/i,
+    );
+  }
+
+  // A path the fixed commit tree proves absent stays an isolated entry.
+  const absent = await makeTemplateRepo(t, {
+    catalog: `${VALID_CATALOG}  absent:\n    description: 未提交\n    default: absent/1.0.0.md\n`,
+  });
+  const isolated = await listTemplates({
+    repoDir: absent.repo,
+    ref: 'HEAD',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(
+    isolated.map((item) => item.id),
+    ['development', 'research'],
+  );
+
+  // Git cannot read an object the tree still lists. That is a read fault, not
+  // an absent template path, so even the tolerant list fails as a whole instead
+  // of returning the entries that happened to read first.
+  const unreadable = await makeTemplateRepo(t);
+  const blobPath = 'templates/research/1.0.0.md';
+  const objectHash = await gitOut(unreadable.repo, [
+    'rev-parse',
+    `${unreadable.commit}:${blobPath}`,
+  ]);
+  assert.deepEqual(
+    (await listTemplates({ repoDir: unreadable.repo, ref: 'HEAD' })).map((item) => item.id),
+    ['development', 'research'],
+  );
+  await rm(
+    path.join(unreadable.repo, '.git', 'objects', objectHash.slice(0, 2), objectHash.slice(2)),
+  );
+  const tree = await gitOut(unreadable.repo, ['ls-tree', unreadable.commit, '--', blobPath]);
+  assert.ok(tree.includes(objectHash), '路径仍存在于已提交的树中');
+  await assert.rejects(
+    () => listTemplates({ repoDir: unreadable.repo, ref: 'HEAD', skipInvalidEntries: true }),
+    /templates\/research\/1\.0\.0\.md 在提交 .* 中读取失败/,
+  );
+});
+
+test('手写非法 catalog key 是已知条目错误：严格接口报原因，工作台仍列出合法模板', async (t) => {
+  // A real catalog can carry a hand-written key like "typo id" next to a valid
+  // development entry. `requireId` validates explicit input, so that mistake is
+  // a known entry-level configuration error and stays isolatable. Treating it as
+  // an unknown failure would empty the workbench development list again.
+  const repo = await makeTemplateRepo(t, {
+    catalog: `${VALID_CATALOG}  typo id:
+    description: 手写键名含空格
+    default: development/1.0.0.md
+`,
+  });
+
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD' }),
+    (error) =>
+      error.code === 'template_entry_invalid' &&
+      /id 只能包含字母、数字、点、下划线或连字符/.test(error.message ?? ''),
+  );
+
+  const isolated = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    role: 'worker',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(isolated.map((item) => item.id), ['development', 'research']);
 });

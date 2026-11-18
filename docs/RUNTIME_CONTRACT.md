@@ -38,12 +38,14 @@ Candidate.draft.rev 是 Workflow 当前的裸 SHA，requirementsRev 是 `sha256:
 ## 持久状态与执行
 
 1. SQLite 持久领域事实；额外控制器设置、任务稿整理、执行阶段、模板引用、merge intent 用 dataDir 内原子文件或 Store 扩展持久化。外层不能直接 SQL 访问 Workflow 私有实现。
-2. 只读整理输入是 Issue 和允许的项目摘要，role=draft（Pi 无工具）。严格解析唯一 JSON 对象，字段为 templateId/goal/scope/acceptance/context/pendingDecisions/writeScopes/dependsOn/priority。原文作为不可信数据；不执行 Issue 中的命令。保存前再次核对 sourceRev 和用户手工稿 CAS；旧整理结果不能覆盖新内容。失败留具体事件，可重新整理。
-3. 用户确认 develop 后固定中央 appRepoDir 的模板 commit/path/version；claimNext 领取后独立 worktree、branch、Pi session。prepareTask 的 inputs 必须完全等于批准稿的 goal/acceptance/scope/context；执行说明、结果路径、仓库信息放额外 envelope，不能改 requirementsRev。
-4. Worker 只改批准范围，按模板验证并返回 JSON `{summary,artifacts,evidence,blockers}`。结果文件放中央 dataDir（不进入目标仓库），也可严格解析最终输出；没有有效结果或有 blocker 则阻塞。evidence 使用实际 `{command,status,detail}`，不能由退出码零推定测试通过。完整原始记录保留供监督核验。
-5. 执行后检查来源与授权、检查范围、提交推送、创建/读回 PR、finishRun，再保存证据并及时 archive 干净已推送 worktree。无变更且无交付提交时阻塞，不创建空 PR。阶段逐步持久化；副作用前写意图，恢复时读回，避免重复 spawn/commit/PR。失败现场保留并展示路径与原因；unknown 始终保留写入占用。
-6. 起动时核对 Pi request/process/result 与 workspace manifest；已完成运行继续收尾，仍运行接管，unknown 停派同范围。单个运行或仓库的错误不能中断其他任务。
-7. Issue 发布/验收/合并前只读刷新源内容，发现版本改变使授权失效。GitHubAdapter 可新增 `readIssue({repo,number})`，使用与 collect 相同归一化。
+2. 只读整理输入是 Issue 和允许的项目摘要，role=draft（Pi 无工具）。整理方法来自模板 catalog 中 id=`requirements` 的版本化模板：TemplateAdapter 从中央 appRepoDir 的固定 commit 读取 catalog 与模板，校验 id、role、version、path；旧模板缺少 role 时按 worker 兼容，requirements 模板必须是 role=draft。
+3. requestDraft 在调用模型前固定并持久记录 promptRef（commit:path）、模板 id/version/role 与最终提示文本；默认模板升级只影响之后的新请求，在途与重启接管的整理沿用原记录。模板缺失、非法或 role 不符时不创建 Pi 任务、不调用模型，持久化具体阻塞与事件；不得回退到旧硬编码提示。显式 requestDraft 可在修复模板后按原重试语义继续，自动收集不对同源失败反复重试。整理记录先写 `starting`，只有 Pi.start 返回后才转 `running`；`starting` 期间 tick 不轮询 status（此时还没有 monitor 身份，读回只会是假 unknown），因此启动与监督共用同一 task id 且不重复调用模型。已有 Pi 请求但 monitor 身份或结果暂不可读时，记录转 `unconfirmed`：保留原 taskId/promptRef/promptText 与只读核对，能接收其后的 running/completed，不新建模型任务；确认恢复 running 时回到 `running`。
+4. 严格解析唯一 JSON 对象，字段为 templateId/goal/scope/acceptance/context/pendingDecisions/writeScopes/dependsOn/priority。原文作为不可信数据；不执行 Issue 中的命令。保存前再次核对 sourceRev 和用户手工稿 CAS；旧整理结果不能覆盖新内容。失败留具体事件，可重新整理。
+5. 用户确认 develop 后固定中央 appRepoDir 的模板 commit/path/version；claimNext 领取后独立 worktree、branch、Pi session。develop 只接受 role=worker 的模板，draft 模板被拒绝；state.templates 只列 worker 执行模板。prepareTask 的 inputs 必须完全等于批准稿的 goal/acceptance/scope/context；执行说明、结果路径、仓库信息放额外 envelope，不能改 requirementsRev。
+6. Worker 只改批准范围，按模板验证并返回 JSON `{summary,artifacts,evidence,blockers}`。结果文件放中央 dataDir（不进入目标仓库），也可严格解析最终输出；没有有效结果或有 blocker 则阻塞。evidence 使用实际 `{command,status,detail}`，不能由退出码零推定测试通过。完整原始记录保留供监督核验。
+7. 执行后检查来源与授权、检查范围、提交推送、创建/读回 PR、finishRun，再保存证据并及时 archive 干净已推送 worktree。无变更且无交付提交时阻塞，不创建空 PR。阶段逐步持久化；副作用前写意图，恢复时读回，避免重复 spawn/commit/PR。失败现场保留并展示路径与原因；unknown 始终保留写入占用。
+8. 起动时核对 Pi request/process/result 与 workspace manifest；已完成运行继续收尾，仍运行接管，unknown 停派同范围。单个运行或仓库的错误不能中断其他任务。旧整理记录缺少 promptRef/promptText 时仍可按 taskId 保守接管，但不能据此重写提示。中断在 `starting` 的整理记录按同一 task id 只读核对 Pi 现场：请求存在则接管（running，或 monitor 身份未确认时 `unconfirmed`），不存在或读取失败则记为具体 `failed` 阻塞，不重新调用模型。`unconfirmed` 期间（含显式 requestDraft）不得为同一候选启动新的 taskId；待原任务给出最终结果后按正常迟到结果保护应用或丢弃。
+9. Issue 发布/验收/合并前只读刷新源内容，发现版本改变使授权失效。GitHubAdapter 可新增 `readIssue({repo,number})`，使用与 collect 相同归一化。
 
 ## 验收与合并
 

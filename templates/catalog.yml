@@ -6,3 +6,7 @@ templates:
   research:
     description: 调研与设计探索，交付有来源的结论。
     default: research/1.0.0.md
+  requirements:
+    description: 只读需求整理，固定 draft 角色并输出严格 JSON 任务稿。
+    role: draft
+    default: requirements/1.0.0.md

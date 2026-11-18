@@ -8,6 +8,11 @@ const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
 const ROLES = new Set(['worker', 'draft']);
+// IDs with a fixed meaning may never be relabelled by repository metadata.
+// `requirements` is the read-only method Runtime itself starts, so declaring it
+// as a worker template (in catalog, frontmatter or both) is invalid content, not
+// a feature toggle.
+const RESERVED_ROLES = new Map([['requirements', 'draft']]);
 const MAX_BUFFER = 16 * 1024 * 1024;
 
 function isObject(value) {
@@ -295,6 +300,12 @@ async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRo
       `模板 ${id} 的 catalog role ${catalogRole} 与模板 role ${template.role} 不一致`,
     );
   }
+  const reservedRole = RESERVED_ROLES.get(id);
+  if (reservedRole !== undefined && template.role !== reservedRole) {
+    throw new Error(
+      `模板 ${id} 的 role 为 ${template.role}，保留 ID 的 role 必须为 ${reservedRole}`,
+    );
+  }
   if (expectedRole !== null && template.role !== expectedRole) {
     throw new Error(`模板 ${id} 的 role 为 ${template.role}，不能作为 ${expectedRole} 模板`);
   }
@@ -344,6 +355,11 @@ export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run, expected
 /**
  * Lists template defaults at exactly one commit, optionally filtered by role so
  * the development UI only offers worker execution templates.
+ *
+ * A broken entry (bad default path, missing file, invalid or conflicting role,
+ * invalid metadata) is reported as an error by `resolveTemplate`, but it must
+ * not hide the remaining valid entries: it is skipped here and never returned.
+ * A repository whose catalog itself cannot be read still fails the whole call.
  */
 export async function listTemplates({ repoDir, ref = 'HEAD', run, role } = {}) {
   const normalizedRepoDir = path.resolve(requireTrimmedString(repoDir, 'repoDir'));
@@ -355,22 +371,29 @@ export async function listTemplates({ repoDir, ref = 'HEAD', run, role } = {}) {
 
   const templates = [];
   for (const id of Object.keys(catalog.templates).sort()) {
-    const templateId = requireId(id);
     const entry = catalog.templates[id];
-    if (!isObject(entry)) {
-      throw new Error(`模板 catalog 中 ${templateId} 的条目不是对象`);
+    let template;
+    let templateId;
+    try {
+      templateId = requireId(id);
+      if (!isObject(entry)) {
+        throw new Error(`模板 catalog 中 ${templateId} 的条目不是对象`);
+      }
+      if (entry.description !== undefined && typeof entry.description !== 'string') {
+        throw new Error(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
+      }
+      template = await resolveCatalogEntry({
+        repoDir: normalizedRepoDir,
+        commit,
+        id: templateId,
+        entry,
+        run: runner,
+        expectedRole: null,
+      });
+    } catch {
+      // Per-entry isolation: one invalid template never clears the others.
+      continue;
     }
-    if (entry.description !== undefined && typeof entry.description !== 'string') {
-      throw new Error(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
-    }
-    const template = await resolveCatalogEntry({
-      repoDir: normalizedRepoDir,
-      commit,
-      id: templateId,
-      entry,
-      run: runner,
-      expectedRole: null,
-    });
     if (expectedRole !== null && template.role !== expectedRole) {
       continue;
     }

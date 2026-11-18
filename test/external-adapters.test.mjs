@@ -1365,3 +1365,61 @@ templates:
     /catalog role 必须是 worker 或 draft/,
   );
 });
+
+test('roles: 保留 ID requirements 不能被改成 worker，列表按条目隔离坏条目', async (t) => {
+  const catalog = `schema_version: 1
+templates:
+  development:
+    description: 开发
+    default: development/1.0.0.md
+  research:
+    description: 调研
+    default: research/1.0.0.md
+  requirements:
+    description: 被改写的整理
+    role: worker
+    default: requirements/1.0.0.md
+  broken:
+    description: 缺失文件
+    default: broken/1.0.0.md
+  baddefault:
+    description: 非法路径
+    default: ../evil.md
+`;
+  const repo = await makeTemplateRepo(t, {
+    catalog,
+    files: {
+      'templates/development/1.0.0.md': templateText('development', '1.0.0', '# 开发'),
+      'templates/research/1.0.0.md': templateText('research', '1.0.0', '# 调研'),
+      'templates/requirements/1.0.0.md': templateText(
+        'requirements',
+        '1.0.0',
+        '# 被改写的整理',
+        'worker',
+      ),
+    },
+  });
+
+  // A relabelled reserved ID is invalid content, not a worker template.
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'requirements' }),
+    /保留 ID 的 role 必须为 draft/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'requirements', expectedRole: 'worker' }),
+    /保留 ID 的 role 必须为 draft/,
+  );
+  await assert.rejects(
+    () => resolveTemplate({ repoDir: repo.repo, id: 'broken' }),
+    /broken\/1\.0\.0\.md 在提交 .* 中不存在或无法读取/,
+  );
+
+  // One broken entry must not clear the other valid worker templates.
+  const workerOnly = await listTemplates({ repoDir: repo.repo, ref: 'HEAD', role: 'worker' });
+  assert.deepEqual(workerOnly.map((item) => item.id), ['development', 'research']);
+  const all = await listTemplates({ repoDir: repo.repo, ref: 'HEAD' });
+  assert.deepEqual(
+    all.map((item) => `${item.id}:${item.role}`),
+    ['development:worker', 'research:worker'],
+  );
+});

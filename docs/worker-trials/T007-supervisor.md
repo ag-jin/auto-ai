@@ -1,6 +1,6 @@
 # T007 真实系统执行监督
 
-状态：首轮 PR #3 真实交付后，独立验收发现竞态，已经现有 Runtime 派发返修。尚未最终验收。记录日期 2026-11-18（Asia/Shanghai）。
+状态：最终 PR #5 已真实交付，主会话独立技术与设计核验通过；等待用户终验与明确合并。三个 Worker 工作树均已回收。记录日期 2026-11-18（Asia/Shanghai）。
 
 ## 授权与链路
 
@@ -51,4 +51,28 @@ Spec 复现：starting 重启接管遇暂时 unknown 时直接改 running，随�
 
 Standards 复核确认中央日志丢失问题已关闭；结果文档尚需更正两点：state 实际为 `repair-runtime-live-state.json`，并非 `runtime-live/state.json`；`run-38…` 与 `run-cbb…` 来自两个隔离 root，每轮各 spawnCalls=2，不能合称同一次的三 session。上述固定提交的主会话唯一闭环证据没有混用这两轮。
 
-Next action：监督第二次返修，独立检查未知状态接管与去重，再核对最终 PR；用户最终验收与合并仍未授权。
+## 最终交付与独立结论
+
+现有 Runtime 第三轮交付 PR #5，最终 head=`defc996b6e63a901254a8701756401c6371c1ccf`。主会话将 PR 基准调整为 design/github-first-templates，使其包含完整 T007 变更，并更新验证说明；首轮 PR #3 和第一次返修 PR #4 已关闭取代，均未合并。最终 Run 的干净树已由 Runtime 确认推送后回收；Git worktree 实际仅余主目录与承载工作台的 review 树。
+
+- 代码提交 `425db49400168f60f7ce9ad731b5ace9dcacf1e0`，主会话独立 `npm test` **111/111**、真实 Pi 隔离闭环 **6/6**；实际只有 draft/worker 各一次模型调用，session 分别为 `af2a2c14-02e3-43d1-96ef-3d7b0d2096fa`、`db64bd97-a85d-4de0-a061-2c0473392abe`，均核对 facaiai-deepseek/deepseek-flash/high。
+- 最终 `defc996` 相对已验证代码只更新 `docs/worker-trials/T007-result.md`，代码与测试 blob 不变；原审查快照 Runtime SHA256=`3cf5e558e3919fdf2fbd0fc1016ad292b3dc08890f3080d86c4e7db51eb53d85` 亦匹配。
+- 完整 10 个修改路径逐项匹配用户批准的 writeScopes；原 draft_rev、requirements_rev 和固定 development/1.2.0 引用在三轮执行中保持不变。
+- 暂时未知状态改为 `unconfirmed`，保留 taskId/提示引用/文本并继续只读核对，能接收其后 running/completed；自动收集和显式整理均不会另开模型调用，同状态事件去重。原来失败的两个接管/去重用例和新增状态保持用例已通过。
+- 三轮实际开发会话、初始只读整理及最后独立闭环的模型配置均有 session 证据；原始日志集中保存，回收未删除最终核验证据。
+
+### Standards 最终复核
+
+固定 defc996 的只读复核确认两处证据说明已更正：state 指向真实存在的 repair-runtime-live-state.json，两轮独立检查的 session 归属明确。中央证据存在，未发现阻碍验收的事实错误。
+
+### Spec 最终复核
+
+独立最小复现由永久 unknown 无稿转为同一任务 `unconfirmed → applied`；修复快照指纹与提交一致，明确接管缺陷已关闭。审查另指出 status() 抛异常的条件性风险；当前生产 PiAdapter 的常规未就绪返回 unknown，任务请求元数据缺失才抛错，此异常分支保留既有阻塞/显式重试语义。本次未扩大控制元数据异常修复范围。
+
+主会话已通过真实工作台记录 **design=approved**，对应最终 PR head；**user=null、state=awaiting_acceptance、active Run=0、merged=false** 均已读回。没有代用户验收或执行 GitHub 合并。代码位于 PR #5，正式工作台基准尚未集成 T007。
+
+中央最终证据：`.auto-ai/validation/T007/attempt3/final-verification.json`、`independent-runtime-live/`、`final-production-state.json`；监督恢复指针 `.auto-ai/T007-active.json`。实际用户批准回执仍为 T007-approval.md，原提案快照保持不变。
+
+任务稿磨合结论：固定输入/允许范围/结果文件能让 Pi 完整交付；具体失败复现、预期行为和确定性回归能在同授权内驱动返修。两次返修均通过当前 Runtime 执行，没有用直接 PiAdapter 旁路替代主流程。
+
+Next action：用户验收 PR #5，并明确决定是否合并；PR #1 的整体工作台终验仍待用户决定。

@@ -18,24 +18,24 @@
 | 固定模型 deepseek-flash/high | 最新真实闭环的 draft/worker 两种 session 与 T006 worker 的 model_change/thinking_level_change 均逐项核对 | 已验证 |
 | 模板历史、默认升级与在途固定版本 | catalog、development/research 历史文件；T007 requirements/1.0.0、role 校验、promptRef/文本持久固定与升级恢复测试 | 开发/调研与需求整理模板已实测；T007 尚待最终验收合并 |
 | 多仓库 UI、审稿、决定、进展/队列、验收与合并 | 实际 Runtime/HTTP/前端 DOM 事件驱动流程，15 类行为与阶段截图；仓库筛选 2→1→2 | 已验证该驱动路径；原生输入通道未通过 |
-| Git 提交、推送、PR 与安全回收 | 真实临时 Git 精确内容和单文件差异；范围包含已提交历史；Runtime 真实创建并读回 PR #3/#4、推送后回收两棵 T007 Worker 树 | 真实 Git/PR 交付已验证；未执行真实 GitHub 合并 |
+| Git 提交、推送、PR 与安全回收 | 真实临时 Git 精确内容和单文件差异；范围包含已提交历史；Runtime 真实创建并读回 PR #3/#4/#5、推送后回收三棵 T007 Worker 树 | 真实 Git/PR 交付已验证；未执行真实 GitHub 合并 |
 | 两种实际验收、当前 head、明确合并、不自行合并 | 后端/HTTP 门槛测试；GUI 分角色、必填设计说明、独立确认、pending 禁重发；真实 PR #1 仍未合并 | 软件门槛已验证；真实用户终验/合并待决定 |
-| 及时提交、用完工作树回收 | T002–T006 Worker 树均归档；T007 前两棵树真实交付后由 Runtime 回收，第三轮正在收尾；日志集中保存 | 已验证前两轮；当前活动现场保留 |
-| 先闭环，再用完整系统推进真实后续开发 | T007 v1 的真实用户批准 → Issue #2 → 工作台收集/整理 → 精确稿 CAS/develop → Pi → PR → 独立失败回归 → 同授权 Runtime retry | 真实自举与返修已验证，最终 PR 交付收尾中 |
+| 及时提交、用完工作树回收 | T002–T006 及 T007 三轮 Worker 树均归档；日志集中保存，Git 仅保留主目录和承载工作台的 review 树 | 已验证，当前无活动开发 Run |
+| 先闭环，再用完整系统推进真实后续开发 | T007 v1 的真实用户批准 → Issue #2 → 工作台收集/整理 → 精确稿 CAS/develop → Pi → PR → 独立失败回归 → 同授权两次 Runtime retry → 最终 PR #5 | 真实自举与返修已验证；用户终验/合并待决定 |
 
 ## 验证的实际范围
 
-- T007 最新代码提交 `425db49` 的独立项目测试 **111/111**；包含模板接入、启动窗口竞态、未知状态同任务接管与防重复派发的行为断言。最终文档提交需核对相关代码 blob 不变。
+- T007 代码提交 `425db49` 的独立项目测试 **111/111**；包含模板接入、启动窗口竞态、未知状态同任务接管与防重复派发的行为断言。最终 PR #5 head `defc996` 仅增加结果文档，代码和测试 blob 已实际核对不变，10 个修改路径全部符合批准范围。
 - 自动监督另有实际计时证据：不手动调用 collect/tick，双仓库收集两轮，一仓失败不影响另一仓，同源只整理一次且没有开发 Run；关闭监督后完整间隔内无第三轮。见 `.auto-ai/validation/watch-loop.json`。
 - 核心独立检查 18/18、执行包检查 35/35。对应 Workflow/prepareTask 源码 blob 与先前通过检查时相同，已实际核对；没有把无关重复测试当进展。
 - 最新主会话独立真实 Pi + 真实临时 Git 6/6：仅两个实际模型调用，draft/worker session 均逐项核对 deepseek-flash/high。该隔离检查的 GitHub PR/合并使用明确替身，没有真实 GitHub 合并。
-- 真实 GitHub 已验证认证、Issue #2 创建/收集/源版本读回、Runtime 实际创建和读回 PR #3/#4。真实开发批准与两次实际 design changes_requested 均经当前工作台记录，返修沿用同一任务稿与模板。GitHub 合并仍未实测。
+- 真实 GitHub 已验证认证、Issue #2 创建/收集/源版本读回、Runtime 实际创建和读回 PR #3/#4/#5。真实开发批准、两次 design changes_requested 与最终 design approved 均经当前工作台记录，返修沿用同一任务稿与模板。PR #5 汇集完整改动，PR #3/#4 已关闭取代且均未合并；用户验收为空，GitHub 合并未实测。
 - GUI 场景的 GitHub/Pi 是明确替身，Runtime/HTTP/生产 UI 与临时 Git 是真实实现。原生输入通道失败，使用同一 CUA 文档允许的 CDP DOM 激活，不声称原生鼠标/键盘通过。
 
 ## 证据入口
 
 - `docs/worker-trials/T005-runtime-supervisor.md`、`T006-supervisor.md`、`T007-supervisor.md`、`UI-full-backend-check.md`。
-- 本机 `.auto-ai/validation/T007/attempt3/independent-verification.json`、`independent-runtime-live/`：最新独立检查和唯一一轮实际 Pi 证据。T007 目录同时保留两次失败复现与前轮证据，不用旧通过日志覆盖新失败。
+- 本机 `.auto-ai/validation/T007/attempt3/final-verification.json`、`independent-runtime-live/`、`final-production-state.json`：最新独立检查、唯一一轮实际 Pi 证据及最终生产状态。T007 目录同时保留两次失败复现与前轮证据，不用旧通过日志覆盖新失败。
 - 本机 `.auto-ai/validation/T006/`：原始失败、独立绿样例、专项、101 项全量及最新真实模型闭环日志。
 - 本机 `.auto-ai/validation/runtime-live/`：最新真实模型 result/state、原始 session 与配置核对；先前成功已移到带时间戳目录，未覆盖历史。
 - 本机 `.auto-ai/validation/ui-full-1794940156037/`：各阶段状态、截图、原始差异快照、最终后端状态、Git bundle 与清理记录。
@@ -44,7 +44,7 @@
 
 ## 尚需用户决定
 
-1. T007 的开发批准已完成，回执见 [T007-approval.md](worker-trials/T007-approval.md)。最新返修 PR 正在由已有 Run 交付，尚未记录用户终验。
+1. T007 的开发批准已完成，回执见 [T007-approval.md](worker-trials/T007-approval.md)。最终 PR #5 已交付，设计核验通过，尚未记录用户终验；正式基准尚未集成此修改。
 2. 真实 PR #1 与最终 T007 PR 的用户验收及合并。执行者不会因上述检查通过自行合并，也不会代用户给出终验通过。
 
-Next action：完成当前 Run 的实际 PR 交付与代码/证据核对，再交用户终验；保持未合并。
+Next action：用户验收 PR #5，并明确决定是否合并；保持实际用户终验和合并门槛。

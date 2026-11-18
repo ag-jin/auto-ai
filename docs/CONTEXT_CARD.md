@@ -2,7 +2,7 @@
 
 ## 目标与授权
 
-已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。T007 已经真实用户批准并经完整系统自举和返修；完整目标仍待最终交付及用户终验/合并，见 `docs/ACCEPTANCE_AUDIT.md`。
+已实现轻量 GitHub 执行工作台：规则收集 Issue → 只读整理标准任务稿 → 用户选择开发/暂缓/忽略 → Pi Worker → 验证与 PR → 用户和设计监督验收、明确合并。T007 已经真实用户批准并经完整系统自举、返修及 PR 交付；完整目标仍待用户终验/合并，见 `docs/ACCEPTANCE_AUDIT.md`。
 
 - 模型固定 `facaiai-deepseek / deepseek-flash / high`，凭据沿用本机配置；生产不以 mock 替代外部失败。
 - 规则命中不构成开发授权；必须确认当前任务稿版本。需求或源内容改变清除旧授权，正文恢复也不恢复旧决定。
@@ -22,9 +22,9 @@
 
 ## 实际证据
 
-- T007 最新代码 `425db49`：主会话独立 `npm test` 111/111、真实 Pi 隔离闭环 6/6；draft/worker 共两个真实 session 均已核对 flash/high，证据 `.auto-ai/validation/T007/attempt3/independent-verification.json`。代码与最小复现审查快照指纹一致，最终结果文档正在收尾。既有核心独立检查 18/18、执行包 35/35。
+- T007 最终 PR #5 head=`defc996b6e63a901254a8701756401c6371c1ccf`。代码 `425db49` 的主会话独立 `npm test` 111/111、真实 Pi 隔离闭环 6/6；最终 head 仅更新结果文档，代码/测试 blob 不变。draft/worker 共两个真实 session 均已核对 flash/high，证据 `.auto-ai/validation/T007/attempt3/final-verification.json`。既有核心独立检查 18/18、执行包 35/35。
 - 真实 Pi 隔离闭环 6/6：需求整理、模拟用户确认、实际 Worker、真实本地 Git 提交推送、工作树回收、验收门槛、合并意图重启去重。两种角色的实际 session 逐项核对为 deepseek-flash/high。
-- 真实 GitHub：Issue #2 创建/收集/源版本读回；完整 Runtime 已实际派发 T007 并创建、读回 PR #3/#4，两次 design changes_requested 和 retry 有真实记录。尚未执行真实 GitHub 合并；隔离检查的合并仍为明确替身。
+- 真实 GitHub：Issue #2 创建/收集/源版本读回；完整 Runtime 实际派发 T007 并创建、读回 PR #3/#4/#5，两次 design changes_requested/retry 有真实记录。PR #5 汇集完整改动、主会话设计核验已通过；旧 PR #3/#4 已关闭取代，均未合并。尚未执行真实 GitHub 合并；隔离检查的合并仍为明确替身。
 - 真实浏览器已用 DOM 事件驱动补齐双仓库闭环：新稿保存后确认、迟到稿保留决定、并行/冲突依赖队列、失败重试、双角色验收、明确合并、pending 刷新及终态只读。Runtime/HTTP/UI/临时 Git 为真实实现，GitHub/Pi 是明确替身。原生输入通道未通过独立探针，不声称原生鼠标/键盘验收通过。
 - 首次正式收集时 1 条 PR 观测被排除、0 条命中需求、0 个开发 Run；后来 T007 真实 Issue 已经批准执行。跨 Origin 与无效令牌实际请求均 403。
 - T006 修复迟到整理清用户决定和同源失败无限自动重试，独立专项 19/19、四类补充样例通过，已集成 `ed0f8cd`。界面修复恢复持久合并方式、合并后只读与匹配的 merge SHA，已集成 `6caffa0`。
@@ -33,7 +33,7 @@
 
 ## 工作树与恢复
 
-T002/T003A/T003B/T004/T005A/T005B/T006 Worker 树均已归档移除；T007 前两轮 Worker 树也已由 Runtime 回收，第三轮正在交付收尾，当前 review 目录固定代码提交供独立检查。恢复以 `.auto-ai/T007-active.json`、实际 Pi result 与进程为准。隔离界面服务和已完成测试的临时 Git/工作树均已清理。
+T002/T003A/T003B/T004/T005A/T005B/T006 及 T007 三轮 Worker 树均已归档移除，日志集中保存。当前保留主目录与承载正式工作台的 review 树；review 检查后回到 review/workbench 并快进主集成分支的状态文档。恢复以 `.auto-ai/T007-active.json`、实际 Pi result 与进程为准。没有活动开发 Run；隔离界面服务和已完成测试的临时 Git/工作树均已清理。
 
 Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录并阻塞；不能静默删除。未知 Pi 进程保留写入占用，不盲目重试。
 
@@ -41,10 +41,6 @@ Git 创建 worktree 后、manifest 写入前的崩溃窗口会保留未知目录
 
 用户已明确回复“批准 T007 v1，用现有系统执行”，批准回执见 `docs/worker-trials/T007-approval.md`。固定 rev=`10fb0c71586487f4b96ed8ce01f3e1d505962474eef697b9516f7dff130e75c5`；`T007-proposed-draft.json` 保留原提案快照，不改写其中历史 authorized=false。
 
-真实 Issue `ag-jin/auto-ai#2` 已被当前工作台收集；Pi 只读整理完成后，按 CAS 保存批准的精确内容，draft_rev 与 requirements_rev 均匹配，再记录 develop。自动整理稿占持久版本 1，批准内容保存为持久版本 2；批准对应的内容 rev 不变。Runtime 已自动启动 `run-01a73750-61af-414e-9407-d286c7b03af4`，开发模板固定 `d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`。
+真实 Issue `ag-jin/auto-ai#2` 经工作台收集、只读整理后，按 CAS 保存批准的精确稿；自动稿占持久版本 1，批准内容为持久版本 2，内容 rev 不变。三个开发 Run 均经 Runtime 派发，沿用同一批准稿和固定开发模板 `d5993e36f42d64ea05e7807820f0bf022abe0b61:templates/development/1.2.0.md`。独立发现的启动竞态、unknown 后永久停查与重复派发已转成回归并修复；历史详见 `docs/worker-trials/T007-supervisor.md`。
 
-首轮实际提交 PR #3 并自动回收 Worker 树。独立全量 106/106 通过，但真实 Pi 复核发现启动竞态：tick 在 Pi.start 返回前误判 unknown，实际已完成结果不再接管。已在 PR #3 记录设计 changes_requested，并提交确定性失败回归 `835e638`；失效的工作树内自测证据引用同时要求修正。
-
-首轮返修 `run-a5500446-44b8-4b27-9238-6b844132e932` 已交付 PR #4（756235e），树已回收。固定提交的独立全量 108/108、真实 Pi 6/6 通过，但新鲜上下文复现另一恢复缺口：starting 重启或身份等待到期的暂时 unknown 会永久停查；显式请求还会重复派发。已记录设计 changes_requested，提交两个确定性失败回归 `2be87c8`。
-
-现有 Runtime 第二次 retry 正在执行 `run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`，从 `2be87c8` 继续，仍沿用原批准稿与模板固定引用。要求保留原 taskId/promptRef/promptText、只读复查未知任务并接收后续结果，不在旧任务未确认停止时重复派发，同时修正结果文档两处证据表述。仓库默认基准已恢复 design/github-first-templates。监督该既有返修并独立核验最终 PR，见 `docs/worker-trials/T007-supervisor.md`。恢复先检查 `.auto-ai/T007-active.json`、工作台和 Pi 现场，避免重复派发。本次批准不包括最终用户验收或合并；PR #1 仍待最终验收。
+最终 Run=`run-ea8cc45c-7e95-4214-ae27-42bb5e7adb2d`，交付 PR #5，base=design/github-first-templates，head=`defc996b6e63a901254a8701756401c6371c1ccf`；完整 10 个修改路径均在批准范围。工作台状态 awaiting_acceptance，design=approved、user=null，未合并；正式基准尚未集成 T007 代码。仓库设置已恢复原基准，自动收集仍关闭。用户对 PR #5 最终验收并明确决定合并；PR #1 整体工作台终验仍待用户决定。恢复先检查 `.auto-ai/T007-active.json` 和实际工作台状态，不重复派发。

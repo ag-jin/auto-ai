@@ -518,6 +518,28 @@ async function dispatchApi(req, res, runtime, token, segments, url) {
         return runtime.decide(id, input);
       },
     };
+  } else if (rest.length === 3 && rest[0] === 'candidates' && rest[2] === 'auto-repair') {
+    const id = rest[1];
+    route = {
+      allowed: ['PUT'],
+      handle: async () => {
+        const body = await readJsonBody(req);
+        if (!isPlainObject(body)) {
+          throw new HttpError(400, 'invalid_body', '自动返修设置必须是 JSON 对象');
+        }
+        if (typeof body.enabled !== 'boolean') {
+          throw new HttpError(400, 'invalid_body', '字段 enabled 必须是布尔值');
+        }
+        // 只接受用户可控的开关和当前稿版本；actor/limit/used/pending 等预算与
+        // 审计字段只由服务端持久化维护，客户端传入的值一律忽略。
+        const input = { enabled: body.enabled };
+        if (body.enabled) {
+          input.draftRev = requireString(body, 'draftRev');
+        }
+        const autoRepair = await runtime.setAutoRepair(id, input);
+        return { candidateId: id, autoRepair };
+      },
+    };
   } else if (rest.length === 3 && rest[0] === 'candidates' && rest[2] === 'retry') {
     const id = rest[1];
     route = {

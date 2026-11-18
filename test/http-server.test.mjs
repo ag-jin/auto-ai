@@ -94,6 +94,20 @@ class FakeRuntime {
     return { id };
   }
 
+  async setAutoRepair(id, input) {
+    this.#record('setAutoRepair', [id, input]);
+    return {
+      candidateId: id,
+      enabled: input.enabled,
+      authorized: true,
+      limit: 2,
+      used: input.enabled ? 0 : 1,
+      remaining: 2,
+      reason: input.enabled ? '自动返修已开启，剩余 2 次' : '自动返修未开启',
+      pendingFromRunId: null,
+    };
+  }
+
   async cancelRun(id) {
     this.#record('cancelRun', [id]);
     return { runId: id, state: 'cancelled', stopped: true };
@@ -906,4 +920,130 @@ test('静态页面可加载，UI 使用实际 HTTP 接口与真实状态字段',
   ]) {
     assert.ok(Object.prototype.hasOwnProperty.call(state.json, key), `state 缺少字段 ${key}`);
   }
+});
+
+test('PUT /api/candidates/:id/auto-repair 校验令牌/同源/类型/当前稿，忽略提权字段并可读回 DTO', async (t) => {
+  const runtime = new FakeRuntime();
+  const server = await startServer(t, { runtime });
+  const token = await stateToken(server);
+  const port = new URL(server.url).port;
+  const origin = `http://127.0.0.1:${port}`;
+  const id = 'owner/repo#7';
+  const candidatePath = `/api/candidates/${encodeURIComponent(id)}/auto-repair`;
+  const body = JSON.stringify({ enabled: true, draftRev: 'rev-1' });
+
+  const noToken = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', origin },
+    body,
+  });
+  assert.equal(noToken.status, 403);
+  assert.equal(noToken.json.error.code, 'invalid_token');
+  assert.equal(runtime.callsFor('setAutoRepair').length, 0);
+
+  const crossSite = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: { ...jsonHeaders(token), origin: 'https://evil.example' },
+    body,
+  });
+  assert.equal(crossSite.status, 403);
+  assert.equal(crossSite.json.error.code, 'invalid_origin');
+  assert.equal(runtime.callsFor('setAutoRepair').length, 0);
+
+  const wrongType = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: jsonHeaders(token),
+    body: JSON.stringify({ enabled: 'yes', draftRev: 'rev-1' }),
+  });
+  assert.equal(wrongType.status, 400);
+  assert.match(wrongType.json.error.message, /enabled/);
+  assert.equal(runtime.callsFor('setAutoRepair').length, 0);
+
+  const missingRev = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: jsonHeaders(token),
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(missingRev.status, 400);
+  assert.match(missingRev.json.error.message, /draftRev/);
+  assert.equal(runtime.callsFor('setAutoRepair').length, 0);
+
+  // Forged actor/budget fields must never reach the Runtime.
+  const forged = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: { ...jsonHeaders(token), origin },
+    body: JSON.stringify({
+      enabled: true,
+      draftRev: 'rev-1',
+      actor: 'design',
+      limit: 99,
+      used: -5,
+      count: 0,
+      pendingRunId: 'run-forged',
+    }),
+  });
+  assert.equal(forged.status, 200);
+  assert.deepEqual(runtime.callsFor('setAutoRepair')[0].args, [
+    id,
+    { enabled: true, draftRev: 'rev-1' },
+  ]);
+  assert.equal(forged.json.candidateId, id);
+  assert.equal(forged.json.autoRepair.enabled, true);
+  assert.equal(forged.json.autoRepair.limit, 2);
+
+  // Candidate DTO readback through the same state response.
+  runtime.state.candidates = [
+    {
+      id,
+      autoRepair: {
+        candidateId: id,
+        enabled: true,
+        authorized: true,
+        limit: 2,
+        used: 1,
+        remaining: 1,
+        reason: '自动返修已开启，剩余 1 次',
+        pendingFromRunId: null,
+        blockedReason: null,
+      },
+    },
+  ];
+  const state = await request(server.url, '/api/state');
+  assert.equal(state.status, 200);
+  const candidate = state.json.candidates.find((entry) => entry.id === id);
+  assert.equal(candidate.autoRepair.enabled, true);
+  assert.equal(candidate.autoRepair.limit, 2);
+  assert.equal(candidate.autoRepair.used, 1);
+  assert.equal(candidate.autoRepair.remaining, 1);
+  assert.equal(candidate.autoRepair.authorized, true);
+
+  // Closing needs no draftRev and is forwarded as a stop only.
+  const close = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: jsonHeaders(token),
+    body: JSON.stringify({ enabled: false, draftRev: 'stale-rev', used: 0, limit: 5 }),
+  });
+  assert.equal(close.status, 200);
+  assert.deepEqual(runtime.callsFor('setAutoRepair')[1].args, [id, { enabled: false }]);
+
+  // A domain conflict (old draftRev) surfaces as 409 without leaking internals.
+  runtime.failures.set(
+    'setAutoRepair',
+    Object.assign(new Error('自动返修只能绑定当前任务稿版本，拒绝旧版本开启'), {
+      statusCode: 409,
+      code: 'conflict',
+    }),
+  );
+  const conflict = await request(server.url, candidatePath, {
+    method: 'PUT',
+    headers: jsonHeaders(token),
+    body,
+  });
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.json.error.code, 'conflict');
+  assertNoLeak(conflict, [token]);
+
+  const get = await request(server.url, candidatePath);
+  assert.equal(get.status, 405);
+  assert.match(get.headers.allow, /PUT/);
 });

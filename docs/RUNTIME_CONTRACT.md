@@ -28,6 +28,7 @@ await runtime.close();
 | `saveDraft(id,input)` | Draft 字段和 `rev`（首次为 null）→ Candidate DTO。rev 是当前稿的 CAS；不匹配 409。持久化字段与 Workflow 规范化一致 |
 | `decide(id,{action,draftRev})` | develop/defer/ignore → Candidate DTO；actor 固定 user。develop 必须当前有效稿、非空验收、无待决策；无稿可 defer/ignore；有稿决定须匹配 rev。ready 未领取时可撤回决定 |
 | `retry(id)` | 已停止且授权仍有效 → Candidate DTO；unknown 不可重试。沿用同一授权固定的模板 commit/path |
+| `setAutoRepair(id,{enabled,draftRev})` | → autoRepair 摘要（policy/已用/剩余/原因/待领取绑定）。开启必须先只读刷新 Issue 来源且要求当前有效开发授权与当前 `draftRev`；来源变化或读取失败时拒绝。关闭总能停止，不要求授权。设置本身不派发 Run |
 | `cancelRun(id)` | → `{runId,state,stopped}`；仅 completed/failed/cancelled 且确认停止可 stopped=true 并阻塞原 Run；unknown 保留 running 占用与工作树 |
 | `recordAcceptance(id,input)` | role/verdict/headSha/comment → 验收记录。design 必须非空实际监督结论；检查实时 PR head、当前需求版本 |
 | `merge(id,{expectedHeadSha,confirmed,method})` | → `{merged:true,mergeSha}` 或 `{merged:false,pending:true,note}`；详见下文 |
@@ -48,6 +49,15 @@ Candidate.draft.rev 是 Workflow 当前的裸 SHA，requirementsRev 是 `sha256:
 7. 执行后检查来源与授权、检查范围、提交推送、创建/读回 PR、finishRun，再保存证据并及时 archive 干净已推送 worktree。无变更且无交付提交时阻塞，不创建空 PR。阶段逐步持久化；副作用前写意图，恢复时读回，避免重复 spawn/commit/PR。失败现场保留并展示路径与原因；unknown 始终保留写入占用。
 8. 起动时核对 Pi request/process/result 与 workspace manifest；已完成运行继续收尾，仍运行接管，unknown 停派同范围。单个运行或仓库的错误不能中断其他任务。旧整理记录缺少 promptRef/promptText 时仍可按 taskId 保守接管，但不能据此重写提示。中断在 `starting` 的整理记录按同一 task id 只读核对 Pi 现场：请求存在则接管（running，或 monitor 身份未确认时 `unconfirmed`），不存在或读取失败则记为具体 `failed` 阻塞，不重新调用模型。`unconfirmed` 期间（含显式 requestDraft）不得为同一候选启动新的 taskId；待原任务给出最终结果后按正常迟到结果保护应用或丢弃。
 9. Issue 发布/验收/合并前只读刷新源内容，发现版本改变使授权失效。GitHubAdapter 可新增 `readIssue({repo,number})`，使用与 collect 相同归一化。
+
+## 有界自动返修
+
+自动返修是任务级显式开关，绑定 `candidate + draftRev + requirementsRev + sourceRev`；默认关闭，上限 2 次，关闭/撤销/漂移都不退已用次数。每次 tick 在领取前只对“显式开启且最新交付在当前 Run/head 有明确 `changes_requested`”的候选做外部核验；默认关闭、无当前意见或预算耗尽时不做任何远程读取。
+
+1. 核验是只读的：先刷新 Issue 来源（来源变化即撤销策略与授权），再读 PR，要求 `state=open` 且 head 与登记交付一致。存在该候选的任何 merge intent、unknown/未确认进程、整理记录 `starting/running/unconfirmed/unknown`、活动/执行中的 Run、失效授权、缺固定模板、异常读取时跳过，并留下可读阻塞原因（`auto_repair.blocked` 事件 + Candidate.autoRepair.blockedReason）。安全读取必须区分“文件缺失”和“文件存在但不可解析”：merge intent 或 Run control 损坏时失败关闭并给出原因，不能当作不存在；展示层可保持原有缺省行为。
+2. 通过核验后由领域 `queueAutoRepair` 原子预留一次预算并入队，再由既有 `claimNext`/prepare/spawn 推进；Runtime 不直接调用 Pi.start。返修 Run 沿用原批准稿、固定模板与执行包，并继续使用 RF001 冻结的原 `changes_requested` 反馈；只有明确记录的验收意见会被消费，控制器不生成设计意见，也不自动合并。
+3. 已入队的自动返修可能因并发上限跨 tick 或跨重启等待。每次最终领取前都会重新核验外部 PR/来源/merge intent/unknown 条件；远程读取返回后以及每个同步 `claimNext` 之前，还必须重新执行一次本地安全检查（整理记录、control、merge intent、活动 Run、授权与模板），不能沿用异步等待前的核验结果。`claimNext({autoRepairAllowlist})` 只允许领取当轮仍通过本地检查的自动队列，未核验或漂移的 pending 保持或按原因取消（`cancelAutoRepair`，预算保留、原因与事件可审阅），通用路径不能绕过。缺省调用保持纯领域语义，手动 ready/retry 不受影响。
+4. 去抖/背压：外部读取失败或 PR 漂移按 `候选+版本+head` 进入有限指数退避，窗口内不重复请求也不重复写同类事件；已入队但连续读取失败 3 次时取消本次排队（预算不回退），交回人工处理。
 
 ## 验收与合并
 

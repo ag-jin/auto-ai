@@ -95,6 +95,34 @@ CREATE TABLE IF NOT EXISTS acceptances (
 );
 CREATE INDEX IF NOT EXISTS acceptances_candidate_idx ON acceptances (candidate_id);
 
+CREATE TABLE IF NOT EXISTS auto_repair_policies (
+  candidate_id TEXT NOT NULL,
+  draft_rev TEXT NOT NULL,
+  requirements_rev TEXT NOT NULL,
+  source_rev TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  limit_value INTEGER NOT NULL DEFAULT 2,
+  pending_run_id TEXT,
+  pending_head_sha TEXT,
+  pending_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (candidate_id, draft_rev, requirements_rev, source_rev)
+);
+
+CREATE TABLE IF NOT EXISTS auto_repair_consumptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id TEXT NOT NULL,
+  draft_rev TEXT NOT NULL,
+  requirements_rev TEXT NOT NULL,
+  source_rev TEXT NOT NULL,
+  from_run_id TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  at TEXT NOT NULL,
+  UNIQUE (candidate_id, draft_rev, requirements_rev, source_rev, from_run_id)
+);
+CREATE INDEX IF NOT EXISTS auto_repair_consumptions_candidate_idx ON auto_repair_consumptions (candidate_id);
+
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL,

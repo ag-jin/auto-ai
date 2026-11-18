@@ -240,12 +240,18 @@ class FakeGitHub {
     this.failCollect = new Set();
     this.issues = new Map();
     this.issueOverrides = new Map();
+    this.issueReads = [];
+    this.readIssueErrors = new Map();
     this.createCalls = [];
     this.mergeCalls = [];
     this.readCalls = [];
+    this.readPrErrors = new Map();
     this.ready = { ready: true, reason: 'fake github ready' };
     this.prs = new Map();
     this.nextPr = 1;
+    // Optional deterministic head per created PR (needed to model distinct
+    // deliveries without real Git); unset keeps the historical fixed fake head.
+    this.headShaSeq = [];
     this.mergeImpl = null;
     this.readPrError = null;
   }
@@ -281,6 +287,11 @@ class FakeGitHub {
   }
 
   async readIssue({ repo, number }) {
+    this.issueReads.push({ repo, number });
+    const readError = this.readIssueErrors.get(`${repo}#${number}`);
+    if (readError) {
+      throw readError;
+    }
     const key = `${repo}#${number}`;
     if (this.issueOverrides.has(key)) {
       return { ...this.issueOverrides.get(key) };
@@ -298,7 +309,11 @@ class FakeGitHub {
     try {
       headSha = await gitOut(worktreePath, ['rev-parse', 'HEAD']);
     } catch {
-      // Fake workspace paths are not real Git worktrees; keep a fixed fake head.
+      // Fake workspace paths are not real Git worktrees; use the deterministic
+      // sequence when a test models several distinct deliveries.
+      if (this.headShaSeq.length > 0) {
+        headSha = this.headShaSeq.shift();
+      }
     }
     const number = this.nextPr;
     this.nextPr += 1;
@@ -319,6 +334,10 @@ class FakeGitHub {
     this.readCalls.push({ repo, number });
     if (this.readPrError) {
       throw this.readPrError;
+    }
+    const readError = this.readPrErrors.get(number);
+    if (readError) {
+      throw readError;
     }
     const pr = this.prs.get(number);
     if (!pr) {
@@ -2649,4 +2668,815 @@ test('RF001 准备后冻结的返修快照在重入与重启后沿用，评论�
   assert.ok(!prompt.includes(later));
   assert.equal(starts().length, 1, '新 Run 在重入与重启后不能再次启动');
   await second.close();
+});
+
+// ---------------------------------------------------------------------------
+// AR001 bounded automatic repair: Runtime wiring (public API + tick only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Starts one candidate through the public Runtime API up to a spawned Worker
+ * Run (collect -> draft -> develop -> tick) without completing it.
+ */
+async function startCandidateRun(t, harness, number, options = {}) {
+  const { runtime, github, pi } = harness;
+  const id = candidateId(number);
+  const list = github.issues.get(REPO) ?? [];
+  github.setIssues(REPO, [
+    ...list.filter((entry) => entry.number !== number),
+    options.issue ?? issue(number),
+  ]);
+  await runtime.collect();
+  const draftCall = pi.startCalls.filter((call) => call.role === 'draft').at(-1);
+  assert.ok(draftCall, `候选 ${id} 应自动安排只读整理`);
+  pi.complete(draftCall.id, draftOutput(options.draft));
+  await runtime.tick();
+
+  const drafted = (await runtime.getState()).candidates.find((item) => item.id === id);
+  assert.ok(drafted?.draft, `候选 ${id} 应形成任务稿`);
+  await runtime.decide(id, { action: 'develop', draftRev: drafted.draft.rev });
+  await runtime.tick();
+
+  const workerCall = pi.startCalls.filter((call) => call.role === 'worker').at(-1);
+  assert.ok(workerCall, `候选 ${id} 应启动 Worker`);
+  return { id, runId: workerCall.id, draft: drafted.draft };
+}
+
+/** Drives one candidate to `awaiting_acceptance` through the public API. */
+async function deliverCandidate(t, harness, number, options = {}) {
+  const { runtime, pi, dataDir } = harness;
+  const { id, runId, draft } = await startCandidateRun(t, harness, number, options);
+  await writeWorkerResult(dataDir, runId, result(options.result));
+  pi.complete(runId, '已写入结果文件');
+  await runtime.tick();
+
+  const state = await runtime.getState();
+  const run = state.runs.find((item) => item.id === runId);
+  assert.equal(run.status, 'awaiting_acceptance', `候选 ${id} 应交付待验收`);
+  assert.ok(run.result?.pr, `候选 ${id} 应交付 PR`);
+  return {
+    id,
+    runId,
+    pr: run.result.pr,
+    headSha: run.result.pr.headSha,
+    draft,
+    templateRef: run.templateRef,
+  };
+}
+
+function workerStarts(pi) {
+  return pi.startCalls.filter((call) => call.role === 'worker');
+}
+
+async function enableAutoRepair(runtime, delivered) {
+  return runtime.setAutoRepair(delivered.id, {
+    enabled: true,
+    draftRev: delivered.draft.rev,
+  });
+}
+
+async function requestRepair(runtime, delivered, headSha, comment) {
+  return runtime.recordAcceptance(delivered.id, {
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment,
+  });
+}
+
+test('自动返修只由 tick 推进：两次上限、冻结原反馈、不改批准版本与模板、从不合并', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi } = harness;
+  await configure(runtime);
+  github.headShaSeq = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40)];
+  await runtime.start();
+
+  const delivered = await deliverCandidate(t, harness, 1);
+  const originalDraftRev = delivered.draft.rev;
+  const originalTemplateRef = delivered.templateRef;
+  assert.equal(delivered.headSha, '1'.repeat(40));
+
+  const enabled = await enableAutoRepair(runtime, delivered);
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.used, 0);
+  assert.equal(enabled.limit, 2);
+  assert.equal(enabled.authorized, true);
+  assert.equal(workerStarts(pi).length, 1, '开启设置本身不派发');
+
+  await requestRepair(runtime, delivered, delivered.headSha, 'AR001 第一轮意见：补充边界测试');
+
+  // Only tick advances the repair: no manual retry anywhere in this flow.
+  await runtime.tick();
+  assert.equal(workerStarts(pi).length, 2, '第一轮自动返修应启动一个 Worker');
+  const firstRepairStart = workerStarts(pi).at(-1);
+  assert.ok(
+    firstRepairStart.prompt.includes('AR001 第一轮意见：补充边界测试'),
+    '原验收意见应被新 Worker 收到',
+  );
+  assert.ok(firstRepairStart.prompt.includes('返修参考'));
+
+  let state = await runtime.getState();
+  let run = latestRunFor(state, delivered.id);
+  assert.equal(run.id, firstRepairStart.id);
+  assert.equal(run.draftRev, originalDraftRev, '批准的 draftRev 不能变化');
+  assert.equal(run.templateRef, originalTemplateRef, '固定模板不能变化');
+  assert.equal(run.requirementsRev, delivered.draft.requirementsRev);
+  state = await runtime.getState();
+  assert.equal(state.candidates.find((item) => item.id === delivered.id).autoRepair.used, 1);
+
+  await writeWorkerResult(harness.dataDir, run.id, result());
+  pi.complete(run.id, '第二轮完成');
+  await runtime.tick();
+  state = await runtime.getState();
+  run = latestRunFor(state, delivered.id);
+  assert.equal(run.status, 'awaiting_acceptance');
+  assert.equal(run.result.pr.headSha, '2'.repeat(40));
+  assert.notEqual(run.result.pr.headSha, delivered.headSha, '每次返修交付是不同 head');
+
+  await requestRepair(runtime, delivered, run.result.pr.headSha, 'AR001 第二轮意见：仍有缺口');
+  await runtime.tick();
+  assert.equal(workerStarts(pi).length, 3, '第二轮自动返修应启动一个 Worker');
+  assert.ok(workerStarts(pi).at(-1).prompt.includes('AR001 第二轮意见：仍有缺口'));
+  state = await runtime.getState();
+  const secondRepair = latestRunFor(state, delivered.id);
+  assert.equal(secondRepair.draftRev, originalDraftRev);
+  assert.equal(secondRepair.templateRef, originalTemplateRef);
+  assert.equal(state.candidates.find((item) => item.id === delivered.id).autoRepair.used, 2);
+  assert.equal(state.candidates.find((item) => item.id === delivered.id).autoRepair.remaining, 0);
+
+  await writeWorkerResult(harness.dataDir, secondRepair.id, result());
+  pi.complete(secondRepair.id, '第三轮完成');
+  await runtime.tick();
+  state = await runtime.getState();
+  const third = latestRunFor(state, delivered.id);
+  assert.equal(third.status, 'awaiting_acceptance');
+  assert.equal(third.result.pr.headSha, '3'.repeat(40));
+
+  // A third explicit changes_requested cannot start a third automatic repair.
+  await requestRepair(runtime, delivered, third.result.pr.headSha, 'AR001 第三轮意见');
+  const issueReads = github.issueReads.length;
+  const prReads = github.readCalls.length;
+  await runtime.tick();
+  await runtime.tick();
+  assert.equal(workerStarts(pi).length, 3, '预算耗尽后不再启动自动返修');
+  assert.equal(github.issueReads.length, issueReads, '耗尽后不读 Issue');
+  assert.equal(github.readCalls.length, prReads, '耗尽后不读 PR');
+
+  state = await runtime.getState();
+  const candidate = state.candidates.find((item) => item.id === delivered.id);
+  assert.equal(candidate.state, 'awaiting_acceptance');
+  assert.equal(candidate.draft.rev, originalDraftRev, '批准的任务稿版本不变');
+  assert.equal(candidate.pinnedTemplate.templateRef, originalTemplateRef, '固定模板不变');
+  assert.equal(candidate.reviews.design.verdict, 'changes_requested');
+  assert.equal(candidate.reviews.design.headSha, third.result.pr.headSha);
+  assert.equal(candidate.reviews.user, null, '不能伪造用户验收');
+  assert.equal(candidate.autoRepair.used, 2);
+  assert.equal(candidate.autoRepair.remaining, 0);
+  assert.match(candidate.autoRepair.reason, /上限/);
+  assert.equal(github.mergeCalls.length, 0, '自动返修从不合并');
+  assert.equal(state.events.filter((event) => event.kind.startsWith('merge.')).length, 0);
+  assert.ok(state.events.some((event) => event.kind === 'auto_repair.queued'));
+  assert.ok(state.events.some((event) => event.kind === 'auto_repair.claimed'));
+  // Both recorded verdicts stay exactly the explicit design ones.
+  const verdicts = state.events
+    .filter((event) => event.kind === 'acceptance.recorded')
+    .map((event) => `${event.data.role}:${event.data.verdict}`);
+  assert.deepEqual(verdicts, ['design:changes_requested', 'design:changes_requested', 'design:changes_requested']);
+  await runtime.close();
+});
+
+test('自动返修默认关闭且无当前意见不读远端，跨重启保留计数，关闭不回退次数', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi, dataDir } = harness;
+  await configure(runtime);
+  github.headShaSeq = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40)];
+  await runtime.start();
+  const delivered = await deliverCandidate(t, harness, 1);
+
+  let candidate = (await runtime.getState()).candidates.find((item) => item.id === delivered.id);
+  assert.equal(candidate.autoRepair.enabled, false, '默认关闭');
+  assert.equal(candidate.autoRepair.used, 0);
+  assert.equal(candidate.autoRepair.limit, 2);
+
+  let issueReads = github.issueReads.length;
+  let prReads = github.readCalls.length;
+  await runtime.tick();
+  await runtime.tick();
+  assert.equal(github.issueReads.length, issueReads, '默认关闭不读 Issue');
+  assert.equal(github.readCalls.length, prReads, '默认关闭不读 PR');
+  assert.equal(workerStarts(pi).length, 1);
+
+  await enableAutoRepair(runtime, delivered);
+  issueReads = github.issueReads.length;
+  prReads = github.readCalls.length;
+  await runtime.tick();
+  assert.equal(github.issueReads.length, issueReads, '没有当前 changes_requested 时不读 Issue');
+  assert.equal(github.readCalls.length, prReads, '没有当前 changes_requested 时不读 PR');
+  assert.equal(workerStarts(pi).length, 1, '没有当前意见不派发');
+
+  await requestRepair(runtime, delivered, delivered.headSha, '重启前意见');
+  await runtime.tick();
+  assert.equal(workerStarts(pi).length, 2);
+  candidate = (await runtime.getState()).candidates.find((item) => item.id === delivered.id);
+  assert.equal(candidate.autoRepair.used, 1);
+
+  // Reopen the Runtime on the same data dir: the reserved count and opt-in stay.
+  await runtime.close();
+  const reopened = new Runtime({
+    dataDir,
+    appRepoDir: APP_REPO,
+    github,
+    pi,
+    workspace: harness.workspace,
+    tickMs: 10,
+  });
+  await reopened.start();
+  candidate = (await reopened.getState()).candidates.find((item) => item.id === delivered.id);
+  assert.equal(candidate.autoRepair.enabled, true);
+  assert.equal(candidate.autoRepair.used, 1, '重开 Runtime 不能重置已用次数');
+  assert.equal(workerStarts(pi).length, 2, '重开 Runtime 不能重复启动同一个自动返修');
+
+  // Finish the first repair delivery after the restart.
+  const repairRun = latestRunFor(await reopened.getState(), delivered.id);
+  assert.equal(repairRun.status, 'running');
+  await writeWorkerResult(dataDir, repairRun.id, result());
+  pi.complete(repairRun.id, '重启后完成');
+  await reopened.tick();
+  const afterRepair = await reopened.getState();
+  const repaired = latestRunFor(afterRepair, delivered.id);
+  assert.equal(repaired.status, 'awaiting_acceptance');
+  assert.equal(repaired.result.pr.headSha, '2'.repeat(40));
+  await requestRepair(reopened, delivered, repaired.result.pr.headSha, '重启后意见');
+
+  // Disable and re-enable: closing never refunds the reserved count.
+  const disabled = await reopened.setAutoRepair(delivered.id, { enabled: false });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.used, 1);
+  assert.equal(disabled.pendingFromRunId, null);
+  await reopened.tick();
+  assert.equal(workerStarts(pi).length, 2, '关闭后不启动');
+  const reenabled = await enableAutoRepair(reopened, delivered);
+  assert.equal(reenabled.enabled, true);
+  assert.equal(reenabled.used, 1, '关闭再开启不回退已用次数');
+  await reopened.tick();
+  assert.equal(workerStarts(pi).length, 3, '重新开启后仍可用第二次自动返修');
+  const capped = (await reopened.getState()).candidates.find((item) => item.id === delivered.id);
+  assert.equal(capped.autoRepair.used, 2);
+  await reopened.tick();
+  assert.equal(workerStarts(pi).length, 3, '重复 tick 不重复派发');
+  await reopened.close();
+});
+
+test('一次外部读取失败只退避该候选，另一候选的自动返修仍然推进', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi } = harness;
+  await configure(runtime);
+  github.headShaSeq = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40)];
+  await runtime.start();
+
+  const failing = await deliverCandidate(t, harness, 1);
+  const advancing = await deliverCandidate(t, harness, 2);
+  for (const delivered of [failing, advancing]) {
+    await enableAutoRepair(runtime, delivered);
+    await requestRepair(runtime, delivered, delivered.headSha, `意见 ${delivered.id}`);
+  }
+
+  const before = workerStarts(pi).length;
+  github.readPrErrors.set(failing.pr.number, new Error('fake PR 读取失败'));
+  await runtime.tick();
+
+  assert.equal(workerStarts(pi).length, before + 1, '另一候选仍应推进');
+  let state = await runtime.getState();
+  const blocked = state.candidates.find((item) => item.id === failing.id);
+  assert.equal(blocked.autoRepair.used, 0, '读取失败不消费预算');
+  assert.match(blocked.autoRepair.blockedReason, /PR/);
+  assert.equal(blocked.state, 'awaiting_acceptance');
+  assert.ok(
+    state.events.some(
+      (event) => event.kind === 'auto_repair.blocked' && event.candidateId === failing.id,
+    ),
+  );
+  assert.equal(state.candidates.find((item) => item.id === advancing.id).autoRepair.used, 1);
+  assert.equal(
+    state.runs.filter((run) => run.candidateId === failing.id).length,
+    1,
+    '读取失败不派发返修 Run',
+  );
+
+  // Bounded backoff: an immediate second tick must not repeat the read/event.
+  const prReads = github.readCalls.filter((call) => call.number === failing.pr.number).length;
+  const blockedEvents = state.events.filter((event) => event.kind === 'auto_repair.blocked').length;
+  await runtime.tick();
+  state = await runtime.getState();
+  assert.equal(
+    github.readCalls.filter((call) => call.number === failing.pr.number).length,
+    prReads,
+    '退避窗口内不重复读 PR',
+  );
+  assert.equal(
+    state.events.filter((event) => event.kind === 'auto_repair.blocked').length,
+    blockedEvents,
+    '退避窗口内不重复写事件',
+  );
+  await runtime.close();
+});
+
+test('容量不足时自动排队跨 tick 等待，漂移/源变化/合并意图/unknown/关闭都不启动，手动任务仍可启动', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi, dataDir } = harness;
+  await configure(runtime);
+  github.headShaSeq = [
+    '1'.repeat(40),
+    '2'.repeat(40),
+    '3'.repeat(40),
+    '4'.repeat(40),
+    '5'.repeat(40),
+    '6'.repeat(40),
+  ];
+  await runtime.start();
+
+  const delivered = [];
+  for (let number = 1; number <= 6; number += 1) {
+    delivered.push(await deliverCandidate(t, harness, number));
+  }
+  const [drift, source, intent, unknown, closed, manual] = delivered;
+
+  // Occupy the only execution slot with a real running Run before enabling any
+  // policy, so a tick cannot claim an automatic repair early.
+  const blocker = await startCandidateRun(t, harness, 9);
+  await configure(runtime, { concurrency: { global: 1, perRepo: 1 } });
+  for (const item of delivered.slice(0, 5)) {
+    await enableAutoRepair(runtime, item);
+    await requestRepair(runtime, item, item.headSha, `待返修 ${item.id}`);
+  }
+
+  await runtime.retry(manual.id);
+  await runtime.tick();
+  let state = await runtime.getState();
+  for (const item of delivered.slice(0, 5)) {
+    const candidate = state.candidates.find((entry) => entry.id === item.id);
+    assert.equal(candidate.state, 'ready', `${item.id} 应等待容量`);
+    assert.equal(candidate.autoRepair.pendingFromRunId, item.runId);
+    assert.equal(candidate.autoRepair.used, 1);
+  }
+  assert.equal(state.runs.filter((run) => run.candidateId === manual.id).length, 1);
+
+  // Apply five independent invalidations while the queue waits for capacity.
+  github.prs.get(drift.pr.number).headSha = 'f'.repeat(40);
+  github.overrideIssue(REPO, 2, issue(2, { body: '正文 2 已被改写' }));
+  const intentDir = path.join(dataDir, 'merge-intents');
+  await mkdir(intentDir, { recursive: true });
+  await writeFile(
+    path.join(
+      intentDir,
+      `${createHash('sha256').update(intent.id).digest('hex').slice(0, 16)}.json`,
+    ),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        candidateId: intent.id,
+        repo: REPO,
+        pr: { number: intent.pr.number, url: intent.pr.url },
+        headSha: intent.headSha,
+        method: 'merge',
+        status: 'pending',
+        at: new Date().toISOString(),
+        note: '遗留合并意图',
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+  const unknownControl = await readControl(dataDir, unknown.runId);
+  await writeControl(dataDir, unknown.runId, {
+    ...unknownControl,
+    spawn: { ...(unknownControl.spawn ?? {}), status: 'unknown' },
+  });
+  await runtime.setAutoRepair(closed.id, { enabled: false });
+
+  // Free the slot: in the same tick the four drifted queues are cancelled, the
+  // changed source revokes its opt-in, and the manual task takes the slot.
+  await writeWorkerResult(dataDir, blocker.runId, result());
+  pi.complete(blocker.runId, '占用结束');
+  const before = workerStarts(pi).length;
+  await runtime.tick();
+  state = await runtime.getState();
+
+  for (const item of [drift, intent, unknown]) {
+    const candidate = state.candidates.find((entry) => entry.id === item.id);
+    assert.equal(state.runs.filter((run) => run.candidateId === item.id).length, 1, `${item.id} 不能启动返修`);
+    assert.equal(candidate.state, 'awaiting_acceptance');
+    assert.equal(candidate.autoRepair.pendingFromRunId, null);
+    assert.equal(candidate.autoRepair.used, 1, `${item.id} 预算保留不回退`);
+    assert.ok(candidate.autoRepair.blockedReason, `${item.id} 应有可读阻塞原因`);
+  }
+  assert.match(
+    state.candidates.find((entry) => entry.id === intent.id).autoRepair.blockedReason,
+    /合并意图/,
+  );
+  assert.match(
+    state.candidates.find((entry) => entry.id === unknown.id).autoRepair.blockedReason,
+    /进程/,
+  );
+  assert.match(
+    state.candidates.find((entry) => entry.id === drift.id).autoRepair.blockedReason,
+    /PR head/,
+  );
+
+  const changedSource = state.candidates.find((entry) => entry.id === source.id);
+  assert.equal(state.runs.filter((run) => run.candidateId === source.id).length, 1);
+  assert.equal(changedSource.state, 'awaiting_decision');
+  assert.equal(changedSource.autoRepair.enabled, false);
+  assert.equal(changedSource.autoRepair.pendingFromRunId, null);
+
+  const closedCandidate = state.candidates.find((entry) => entry.id === closed.id);
+  assert.equal(state.runs.filter((run) => run.candidateId === closed.id).length, 1);
+  assert.equal(closedCandidate.autoRepair.enabled, false);
+  assert.equal(closedCandidate.autoRepair.used, 1, '关闭不回退已用次数');
+  assert.equal(closedCandidate.autoRepair.pendingFromRunId, null);
+
+  // The unrelated manual task still started once the slot was free.
+  assert.equal(workerStarts(pi).length, before + 1);
+  assert.equal(state.runs.filter((run) => run.candidateId === manual.id).length, 2);
+  assert.equal(latestRunFor(state, manual.id).status, 'running');
+  assert.ok(
+    state.events.some(
+      (event) => event.kind === 'auto_repair.cancelled' && event.candidateId === drift.id,
+    ),
+  );
+  await runtime.close();
+});
+
+test('Runtime.setAutoRepair 开启需当前授权并刷新来源，关闭总是可用', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi } = harness;
+  await configure(runtime);
+  await runtime.start();
+
+  const id = candidateId(1);
+  github.setIssues(REPO, [issue(1)]);
+  await runtime.collect();
+  const draftCall = pi.startCalls.filter((call) => call.role === 'draft').at(-1);
+  pi.complete(draftCall.id, draftOutput());
+  await runtime.tick();
+  let candidate = (await runtime.getState()).candidates.find((item) => item.id === id);
+  const draftRev = candidate.draft.rev;
+
+  // No develop decision yet: enabling is rejected and writes nothing.
+  await assert.rejects(
+    runtime.setAutoRepair(id, { enabled: true, draftRev }),
+    (error) => error.statusCode === 409 && /授权/.test(error.message),
+  );
+  await assert.rejects(
+    runtime.setAutoRepair(id, { enabled: true }),
+    (error) => error.statusCode === 400,
+  );
+  await assert.rejects(
+    runtime.setAutoRepair(id, { enabled: 'yes', draftRev }),
+    (error) => error.statusCode === 400,
+  );
+  assert.equal((await runtime.getState()).candidates.find((item) => item.id === id).autoRepair.enabled, false);
+
+  await runtime.decide(id, { action: 'develop', draftRev });
+  // A stale draftRev never enables the policy.
+  await assert.rejects(
+    runtime.setAutoRepair(id, { enabled: true, draftRev: 'stale-rev' }),
+    (error) => error.statusCode === 409,
+  );
+  const enabled = await runtime.setAutoRepair(id, { enabled: true, draftRev });
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.used, 0);
+  candidate = (await runtime.getState()).candidates.find((item) => item.id === id);
+  assert.equal(candidate.autoRepair.enabled, true);
+  assert.equal(candidate.autoRepair.draftRev, draftRev);
+  assert.equal(typeof candidate.autoRepair.reason, 'string');
+  assert.equal(candidate.autoRepair.blockedReason, null);
+
+  // Enabling refreshes the source: a changed Issue fails closed.
+  github.overrideIssue(REPO, 1, issue(1, { body: '正文 1 已变化' }));
+  await assert.rejects(
+    runtime.setAutoRepair(id, { enabled: true, draftRev }),
+    (error) => error.statusCode === 409 && /source_changed/.test(error.code ?? ''),
+  );
+  candidate = (await runtime.getState()).candidates.find((item) => item.id === id);
+  assert.equal(candidate.autoRepair.enabled, false);
+  assert.equal(candidate.draftStale, true);
+
+  // Closing always works, even without a current authorization/draft version.
+  const disabled = await runtime.setAutoRepair(id, { enabled: false });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.used, 0);
+  assert.ok(typeof disabled.reason === 'string' && disabled.reason.length > 0);
+
+  // A candidate without any draft can still be closed (a no-op stop).
+  github.setIssues(REPO, [issue(1, { body: '正文 1 已变化' }), issue(7)]);
+  await runtime.collect();
+  const noDraft = (await runtime.getState()).candidates.find((item) => item.id === candidateId(7));
+  assert.equal(noDraft.draft, null);
+  const closedNoDraft = await runtime.setAutoRepair(noDraft.id, { enabled: false });
+  assert.equal(closedNoDraft.enabled, false);
+  await runtime.close();
+});
+
+test('未通过当轮核验的自动 pending 不会被通用领取，无关手动任务仍可领取', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi, dataDir } = harness;
+  await configure(runtime);
+  github.headShaSeq = ['1'.repeat(40), '2'.repeat(40)];
+  await runtime.start();
+
+  const auto = await deliverCandidate(t, harness, 1);
+  const manual = await deliverCandidate(t, harness, 2);
+  const blocker = await startCandidateRun(t, harness, 9);
+  await configure(runtime, { concurrency: { global: 1, perRepo: 1 } });
+
+  await enableAutoRepair(runtime, auto);
+  await requestRepair(runtime, auto, auto.headSha, '待返修意见');
+  await runtime.retry(manual.id);
+  await runtime.tick();
+
+  let state = await runtime.getState();
+  assert.equal(
+    state.candidates.find((item) => item.id === auto.id).autoRepair.pendingFromRunId,
+    auto.runId,
+  );
+
+  // The queued repair cannot pass this round's external verification.
+  github.readPrErrors.set(auto.pr.number, new Error('fake PR 读取失败'));
+  await writeWorkerResult(dataDir, blocker.runId, result());
+  pi.complete(blocker.runId, '占用结束');
+  await runtime.tick();
+  state = await runtime.getState();
+
+  const pending = state.candidates.find((item) => item.id === auto.id);
+  assert.equal(pending.autoRepair.pendingFromRunId, auto.runId, '未核验的 pending 不能领取也不能取消');
+  assert.equal(pending.autoRepair.used, 1);
+  assert.equal(state.runs.filter((run) => run.candidateId === auto.id).length, 1);
+  assert.equal(
+    state.events.some(
+      (event) => event.kind === 'auto_repair.cancelled' && event.candidateId === auto.id,
+    ),
+    false,
+  );
+  assert.ok(
+    state.events.some(
+      (event) => event.kind === 'auto_repair.blocked' && event.candidateId === auto.id,
+    ),
+  );
+
+  // The unrelated manual task still takes the freed slot.
+  assert.equal(state.runs.filter((run) => run.candidateId === manual.id).length, 2);
+  assert.equal(latestRunFor(state, manual.id).status, 'running');
+  await runtime.close();
+});
+
+test('AR001 独立回归：PR 核验等待期间启动整理必须阻止自动领取', async (t) => {
+  const harness = await makeRuntime(t);
+  const { runtime, github, pi } = harness;
+  await configure(runtime);
+  await runtime.start();
+  try {
+    const delivered = await deliverCandidate(t, harness, 1);
+    await enableAutoRepair(runtime, delivered);
+    await requestRepair(runtime, delivered, delivered.headSha, '独立竞态回归');
+    const originalRead = github.readPullRequest.bind(github);
+    let release;
+    let entered;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const reached = new Promise((resolve) => { entered = resolve; });
+    github.readPullRequest = async (...args) => {
+      entered();
+      await gate;
+      return originalRead(...args);
+    };
+    const before = workerStarts(pi).length;
+    const ticking = runtime.tick();
+    try {
+      await Promise.race([
+        reached,
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('未到达 PR 核验等待点')), 5000);
+          timer.unref();
+        }),
+      ]);
+      await runtime.requestDraft(delivered.id);
+      assert.equal(pi.startCalls.at(-1).role, 'draft');
+    } finally {
+      release();
+      await ticking;
+    }
+    assert.equal(workerStarts(pi).length, before, '整理已运行，不能使用异步等待前的核验结果启动返修 Worker');
+    assert.equal(github.mergeCalls.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('AR001 回归：异步核验与准备期间启动整理必须逐次本地复核', async (t) => {
+  const harness = await makeRuntime(t, { tickMs: 3_600_000 });
+  const { runtime, github, pi, workspace } = harness;
+  await configure(runtime);
+  await runtime.start();
+  try {
+    const a = await deliverCandidate(t, harness, 1);
+    const b = await deliverCandidate(t, harness, 2);
+    const c = await deliverCandidate(t, harness, 3);
+    for (const item of [a, b, c]) {
+      await enableAutoRepair(runtime, item);
+      await requestRepair(runtime, item, item.headSha, `逐次复核 ${item.id}`);
+    }
+
+    const originalRead = github.readPullRequest.bind(github);
+    const reads = [];
+    let releaseB;
+    let enteredB;
+    const bGate = new Promise((resolve) => { releaseB = resolve; });
+    const bReached = new Promise((resolve) => { enteredB = resolve; });
+    github.readPullRequest = async (input) => {
+      reads.push(input.number);
+      if (reads.length === 2) {
+        enteredB();
+        await bGate;
+      }
+      return originalRead(input);
+    };
+
+    const originalCreate = workspace.create.bind(workspace);
+    let releasePrepare;
+    let enteredPrepare;
+    let pauseNextCreate = true;
+    const prepareGate = new Promise((resolve) => { releasePrepare = resolve; });
+    const prepareReached = new Promise((resolve) => { enteredPrepare = resolve; });
+    workspace.create = async (input) => {
+      if (pauseNextCreate) {
+        pauseNextCreate = false;
+        enteredPrepare();
+        await prepareGate;
+      }
+      return originalCreate(input);
+    };
+
+    const before = workerStarts(pi).length;
+    const ticking = runtime.tick();
+    try {
+      // A was verified first; start its explicit draft while B's PR read waits.
+      await Promise.race([
+        bReached,
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('未到达候选 B 的 PR 核验等待点')), 5000);
+          timer.unref();
+        }),
+      ]);
+      assert.equal(reads[0], a.pr.number, '候选 A 必须先完成核验');
+      await runtime.requestDraft(a.id);
+
+      // B is claimed after A is filtered; start C's draft while B prepares.
+      releaseB();
+      await Promise.race([
+        prepareReached,
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('未到达候选 B 的执行准备等待点')), 5000);
+          timer.unref();
+        }),
+      ]);
+      await runtime.requestDraft(c.id);
+    } finally {
+      releaseB();
+      releasePrepare();
+      await ticking;
+    }
+
+    const state = await runtime.getState();
+    assert.equal(workerStarts(pi).length, before + 1, '只有候选 B 的返修可以启动');
+    assert.equal(state.runs.filter((run) => run.candidateId === a.id).length, 1, 'A 不能领取');
+    assert.equal(state.runs.filter((run) => run.candidateId === b.id).length, 2, 'B 应完成本次返修');
+    assert.equal(state.runs.filter((run) => run.candidateId === c.id).length, 1, 'C 不能领取');
+    const aCandidate = state.candidates.find((item) => item.id === a.id);
+    const cCandidate = state.candidates.find((item) => item.id === c.id);
+    assert.equal(aCandidate.autoRepair.pendingFromRunId, null);
+    assert.equal(cCandidate.autoRepair.pendingFromRunId, null);
+    assert.ok(aCandidate.autoRepair.blockedReason);
+    assert.ok(cCandidate.autoRepair.blockedReason);
+    assert.equal(github.mergeCalls.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('AR001 回归：整理状态 unknown 必须阻止自动领取', async (t) => {
+  const harness = await makeRuntime(t, { tickMs: 3_600_000 });
+  const { runtime, pi } = harness;
+  await configure(runtime);
+  await runtime.start();
+  try {
+    const delivered = await deliverCandidate(t, harness, 1);
+    await enableAutoRepair(runtime, delivered);
+    await requestRepair(runtime, delivered, delivered.headSha, '整理状态 unknown 回归');
+
+    const draftsBefore = pi.startCalls.filter((call) => call.role === 'draft').length;
+    await runtime.requestDraft(delivered.id);
+    const draftTask = pi.startCalls.filter((call) => call.role === 'draft').at(-1);
+    assert.equal(
+      pi.startCalls.filter((call) => call.role === 'draft').length,
+      draftsBefore + 1,
+      '显式整理必须启动一次',
+    );
+
+    const originalStatus = pi.status.bind(pi);
+    pi.status = async (id) => {
+      if (id === draftTask.id) {
+        throw new Error('fake 整理状态读取失败');
+      }
+      return originalStatus(id);
+    };
+
+    const before = workerStarts(pi).length;
+    await runtime.tick();
+    const state = await runtime.getState();
+    const candidate = state.candidates.find((item) => item.id === delivered.id);
+    assert.equal(
+      workerStarts(pi).length,
+      before,
+      '整理状态未知时不能使用旧核验结果启动返修 Worker',
+    );
+    assert.equal(state.runs.filter((run) => run.candidateId === delivered.id).length, 1);
+    assert.ok(candidate.autoRepair.blockedReason, '整理状态未知必须给出可读阻塞原因');
+    assert.match(candidate.autoRepair.blockedReason, /整理|unknown/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('AR001 回归：合并意图 JSON 损坏时自动返修失败关闭且手动任务仍可领取', async (t) => {
+  const harness = await makeRuntime(t, { tickMs: 3_600_000 });
+  const { runtime, dataDir, pi } = harness;
+  await configure(runtime);
+  await runtime.start();
+  try {
+    const delivered = await deliverCandidate(t, harness, 1);
+    const manual = await deliverCandidate(t, harness, 2);
+    await enableAutoRepair(runtime, delivered);
+    await requestRepair(runtime, delivered, delivered.headSha, '合并意图损坏回归');
+
+    const intentDir = path.join(dataDir, 'merge-intents');
+    await mkdir(intentDir, { recursive: true });
+    await writeFile(
+      path.join(
+        intentDir,
+        `${createHash('sha256').update(delivered.id).digest('hex').slice(0, 16)}.json`,
+      ),
+      '{"schemaVersion":1,"candidateId":',
+      'utf8',
+    );
+
+    await runtime.retry(manual.id);
+    const before = workerStarts(pi).length;
+    await runtime.tick();
+    const state = await runtime.getState();
+    const candidate = state.candidates.find((item) => item.id === delivered.id);
+
+    assert.equal(workerStarts(pi).length, before + 1, '只有无关手动任务可以启动');
+    assert.equal(state.runs.filter((run) => run.candidateId === delivered.id).length, 1);
+    assert.equal(candidate.autoRepair.pendingFromRunId, null);
+    assert.ok(candidate.autoRepair.blockedReason, '损坏的合并意图必须给出可读阻塞原因');
+    assert.match(candidate.autoRepair.blockedReason, /合并意图/);
+    assert.equal(latestRunFor(state, manual.id).status, 'running');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('AR001 回归：控制文件 JSON 损坏时自动返修失败关闭且手动任务仍可领取', async (t) => {
+  const harness = await makeRuntime(t, { tickMs: 3_600_000 });
+  const { runtime, dataDir, pi } = harness;
+  await configure(runtime);
+  await runtime.start();
+  try {
+    const delivered = await deliverCandidate(t, harness, 1);
+    const manual = await deliverCandidate(t, harness, 2);
+    await enableAutoRepair(runtime, delivered);
+    await requestRepair(runtime, delivered, delivered.headSha, '控制文件损坏回归');
+
+    await writeFile(
+      path.join(dataDir, 'runs', delivered.runId, 'control.json'),
+      '{"schemaVersion":1,',
+      'utf8',
+    );
+
+    await runtime.retry(manual.id);
+    const before = workerStarts(pi).length;
+    await runtime.tick();
+    const state = await runtime.getState();
+    const candidate = state.candidates.find((item) => item.id === delivered.id);
+
+    assert.equal(workerStarts(pi).length, before + 1, '只有无关手动任务可以启动');
+    assert.equal(state.runs.filter((run) => run.candidateId === delivered.id).length, 1);
+    assert.equal(candidate.autoRepair.pendingFromRunId, null);
+    assert.ok(candidate.autoRepair.blockedReason, '损坏的控制文件必须给出可读阻塞原因');
+    assert.match(candidate.autoRepair.blockedReason, /控制|进程/);
+    assert.equal(latestRunFor(state, manual.id).status, 'running');
+  } finally {
+    await runtime.close();
+  }
 });

@@ -44,9 +44,21 @@ const DRAFT_PENDING_STATES = new Set(['starting', 'running', 'unconfirmed']);
 // An `unconfirmed` record keeps being polled read-only until its task reports a
 // final result.
 const DRAFT_POLLABLE_STATES = new Set(['running', 'unconfirmed']);
+// A failed `status` read persists `unknown`: the draft still may own the Pi
+// request, so automatic repair must treat it exactly like another pending
+// draft. An explicit requestDraft may still retry it.
+const AUTO_REPAIR_DRAFT_BLOCKING_STATES = new Set([...DRAFT_PENDING_STATES, 'unknown']);
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
+// Bounded automatic repair (AR001) external re-verification. A failing or
+// drifting candidate is re-read only after a short, growing window so one bad
+// PR never produces a GitHub request or event on every tick.
+const AUTO_REPAIR_BACKOFF_MS = 30_000;
+const AUTO_REPAIR_MAX_BACKOFF_MS = 15 * 60_000;
+// A queued automatic repair whose external verification keeps failing is
+// cancelled (budget preserved) instead of blocking the candidate forever.
+const AUTO_REPAIR_MAX_READ_FAILURES = 3;
 // The requirements method is versioned Git content, never a hard-coded prompt.
 const REQUIREMENTS_TEMPLATE_ID = 'requirements';
 
@@ -247,14 +259,37 @@ export class Runtime {
   #drafts = new Map();
   #draftMutation = Promise.resolve();
   #mergeQueues = new Map();
+  #autoRepairBackoff = new Map();
+  #autoRepairObserved = new Map();
+  #autoRepairBackoffMs;
+  #clock;
 
-  constructor({ dataDir, appRepoDir, github, workspace, pi, tickMs = 1000 } = {}) {
+  constructor({
+    dataDir,
+    appRepoDir,
+    github,
+    workspace,
+    pi,
+    tickMs = 1000,
+    // Test seam for the bounded automatic-repair backoff; production keeps the
+    // 30s default and the wall clock.
+    autoRepairBackoffMs = AUTO_REPAIR_BACKOFF_MS,
+    clock = () => Date.now(),
+  } = {}) {
     this.#dataDir = requireAbsolutePath(dataDir, 'dataDir');
     this.#appRepoDir = requireAbsolutePath(appRepoDir, 'appRepoDir');
     if (!Number.isInteger(tickMs) || tickMs < 10 || tickMs > 3600000) {
       throw new Error('tickMs 必须是 10 到 3600000 之间的整数');
     }
     this.#tickMs = tickMs;
+    if (!Number.isInteger(autoRepairBackoffMs) || autoRepairBackoffMs < 0 || autoRepairBackoffMs > 3600000) {
+      throw new Error('autoRepairBackoffMs 必须是 0 到 3600000 之间的整数');
+    }
+    this.#autoRepairBackoffMs = autoRepairBackoffMs;
+    if (typeof clock !== 'function') {
+      throw new Error('clock 必须是返回毫秒时间戳的函数');
+    }
+    this.#clock = clock;
 
     this.#github = github ?? new GitHubAdapter();
     this.#workspace = workspace ?? new WorkspaceAdapter({ rootDir: path.join(this.#dataDir, 'workspace') });
@@ -547,6 +582,7 @@ export class Runtime {
         : null,
       mergePending: Boolean(mergedIntent && mergedIntent.status !== 'merged'),
       mergeIntent: mergedIntent,
+      autoRepair: this.#autoRepairDto(candidate),
       blockedReason,
       draftStale: candidate.draftStale,
       createdAt: candidate.createdAt,
@@ -1058,6 +1094,60 @@ export class Runtime {
     }
   }
 
+  /**
+   * Persists the bounded automatic-repair opt-in for one candidate.
+   *
+   * Enabling requires the current `draftRev`, a live re-read of the Issue source
+   * (a changed source or an unreadable source fails closed) and the domain's
+   * current develop authorization. Disabling is always available so the user can
+   * stop automatic repair even after the source/authorization is gone. Neither
+   * branch dispatches a Run: the next tick re-verifies the live PR first.
+   */
+  async setAutoRepair(id, input) {
+    if (this.#closing) throw httpError(503, 'runtime_closing', '工作台正在停止');
+    const workflow = this.#wf;
+    workflow.getCandidate(id);
+    if (!isObject(input)) {
+      throw httpError(400, 'invalid_input', '自动返修设置必须是对象');
+    }
+    if (typeof input.enabled !== 'boolean') {
+      throw httpError(400, 'invalid_input', 'autoRepair.enabled 必须是布尔值');
+    }
+
+    if (!input.enabled) {
+      let disabled;
+      try {
+        disabled = workflow.setAutoRepair(id, { enabled: false });
+      } catch (error) {
+        throw this.#domainError(error);
+      }
+      this.#autoRepairObserved.delete(id);
+      return disabled;
+    }
+
+    if (typeof input.draftRev !== 'string' || input.draftRev.trim().length === 0) {
+      throw httpError(400, 'invalid_input', '开启自动返修需要当前任务稿的 draftRev');
+    }
+    // Read-only source refresh before enabling: only the current Issue version
+    // and its current develop authorization may carry the opt-in.
+    const fresh = await this.#refreshSource(id);
+    if (fresh.changed) {
+      throw httpError(
+        409,
+        'source_changed',
+        'Issue 内容已变化，原开发授权失效，不能开启自动返修',
+        { previousSourceRev: fresh.previousSourceRev, sourceRev: fresh.sourceRev },
+      );
+    }
+    try {
+      const enabled = workflow.setAutoRepair(id, { enabled: true, draftRev: input.draftRev });
+      this.#autoRepairObserved.delete(id);
+      return enabled;
+    } catch (error) {
+      throw this.#domainError(error);
+    }
+  }
+
   // ---------------------------------------------------------------------
   // Cancellation
   // ---------------------------------------------------------------------
@@ -1377,14 +1467,23 @@ export class Runtime {
     return { merged: true, mergeSha };
   }
 
-  #mergeIntentSummary(candidateId) {
+  /**
+   * Distinguishes a missing merge intent from an unreadable/corrupt one. The
+   * display summary keeps the legacy `null` for both, but safety guards must
+   * fail closed when a file exists and cannot be parsed.
+   */
+  #readMergeIntentRecord(candidateId) {
     const file = path.join(this.#mergeIntentsDir, `${sha256(candidateId).slice(0, 16)}.json`);
-    let intent;
     try {
-      intent = readJsonFile(file);
-    } catch {
-      return null;
+      const intent = readJsonFile(file);
+      return { present: intent !== null, intent, error: null };
+    } catch (error) {
+      return { present: true, intent: null, error: errorMessage(error) };
     }
+  }
+
+  #mergeIntentSummary(candidateId) {
+    const intent = this.#readMergeIntentRecord(candidateId).intent;
     if (!intent) {
       return null;
     }
@@ -1469,6 +1568,512 @@ export class Runtime {
   }
 
   // ---------------------------------------------------------------------
+  // Bounded automatic repair (AR001)
+  // ---------------------------------------------------------------------
+
+  #autoRepairDto(candidate) {
+    const policy = this.#wf.getAutoRepair(candidate.id);
+    const observed = this.#autoRepairObserved.get(candidate.id) ?? null;
+    return {
+      ...policy,
+      blockedReason: observed?.reason ?? null,
+      blockedAt: observed?.at ?? null,
+      nextAttemptAt: observed?.nextAt ?? null,
+    };
+  }
+
+  #autoRepairKey(policy, headSha) {
+    return [
+      policy.candidateId,
+      policy.draftRev ?? 'no-draft',
+      policy.sourceRev ?? 'no-source',
+      headSha ?? 'no-head',
+    ].join('|');
+  }
+
+  #autoRepairGate(key) {
+    const entry = key ? this.#autoRepairBackoff.get(key) : null;
+    if (entry && entry.nextAt > this.#clock()) {
+      return { allowed: false, until: entry.nextAt };
+    }
+    return { allowed: true, until: null };
+  }
+
+  #clearAutoRepairBackoff(key) {
+    if (key) {
+      this.#autoRepairBackoff.delete(key);
+    }
+  }
+
+  #noteAutoRepairBackoff(key, reason, { backoff = true } = {}) {
+    if (!key) {
+      return { failures: 0, nextAt: null };
+    }
+    const previous = this.#autoRepairBackoff.get(key) ?? null;
+    const failures = backoff ? (previous?.failures ?? 0) + 1 : 0;
+    const delay = backoff
+      ? Math.min(
+          this.#autoRepairBackoffMs * 2 ** Math.max(0, failures - 1),
+          AUTO_REPAIR_MAX_BACKOFF_MS,
+        )
+      : 0;
+    const nowMs = this.#clock();
+    const nextAt = nowMs + delay;
+    this.#autoRepairBackoff.set(key, { failures, nextAt, lastReason: reason });
+    if (this.#autoRepairBackoff.size > 256) {
+      for (const [entryKey, entry] of this.#autoRepairBackoff) {
+        if (entry.nextAt <= nowMs) {
+          this.#autoRepairBackoff.delete(entryKey);
+        }
+      }
+    }
+    return { failures, nextAt: delay > 0 ? nextAt : null };
+  }
+
+  /**
+   * Persists one readable automatic-repair pause. Only the first reason per
+   * candidate/version/head is written as an `auto_repair.blocked` event; an
+   * identical repeated reason inside the backoff window stays silent so a
+   * persistent PR fault cannot spam the event log every tick.
+   */
+  #observeAutoRepairBlocked(policy, reason, { key = null, headSha = null, backoff = true } = {}) {
+    const observedBefore = this.#autoRepairObserved.get(policy.candidateId) ?? null;
+    const atMs = this.#clock();
+    const { failures, nextAt } = this.#noteAutoRepairBackoff(key, reason, { backoff });
+    this.#autoRepairObserved.set(policy.candidateId, {
+      reason,
+      at: new Date(atMs).toISOString(),
+      nextAt: nextAt === null ? null : new Date(nextAt).toISOString(),
+    });
+    if (observedBefore?.reason === reason) {
+      return { failures, nextAt };
+    }
+    try {
+      this.#wf.recordEvent({
+        kind: 'auto_repair.blocked',
+        message: `候选 ${policy.candidateId} 自动返修暂停：${reason}`,
+        candidateId: policy.candidateId,
+        runId: policy.pendingFromRunId ?? null,
+        data: {
+          draftRev: policy.draftRev,
+          sourceRev: policy.sourceRev,
+          headSha,
+          used: policy.used,
+          limit: policy.limit,
+          failures,
+          backoffUntil: nextAt === null ? null : new Date(nextAt).toISOString(),
+        },
+      });
+    } catch {
+      // Observation/event logging must never break other candidates.
+    }
+    return { failures, nextAt };
+  }
+
+  #cancelQueuedAutoRepair(policy, reason) {
+    try {
+      return this.#wf.cancelAutoRepair(policy.candidateId, { reason });
+    } catch {
+      return { cancelled: false };
+    }
+  }
+
+  #handleAutoRepairBlocked(policy, reason, { key, headSha, pending, drift }) {
+    if (pending && drift) {
+      // Deterministic external/local drift: stop this queued repair at once.
+      // The reserved budget is kept and the reason is audited.
+      this.#cancelQueuedAutoRepair(policy, `自动排队已失效：${reason}`);
+    }
+    return this.#observeAutoRepairBlocked(policy, reason, { key, headSha });
+  }
+
+  #recordAutoRepairReadFailure(policy, key, headSha, reason, pending) {
+    const { failures } = this.#observeAutoRepairBlocked(policy, reason, { key, headSha });
+    if (pending && failures >= AUTO_REPAIR_MAX_READ_FAILURES) {
+      // Bounded: transient read faults keep the queue, a persistent one hands the
+      // candidate back for manual handling without refunding the reserved unit.
+      this.#cancelQueuedAutoRepair(
+        policy,
+        `自动排队外部核验连续失败 ${failures} 次，取消本次排队（预算保留）：${reason}`,
+      );
+    }
+  }
+
+  /** Local-only automatic-repair blockers; none of these read GitHub. */
+  #autoRepairLocalBlockers(candidate, latest, policy, { runningCandidates }) {
+    const reasons = [];
+    if (!candidate.filter.matched) {
+      reasons.push('候选未命中收集规则');
+    }
+    if (!candidate.draft) {
+      reasons.push('候选没有当前任务稿');
+    } else if (candidate.draftStale) {
+      reasons.push('任务稿已因 Issue 源内容变化失效');
+    }
+    if (!policy.authorized) {
+      reasons.push('没有与当前任务稿一致的用户开发授权');
+    }
+    if (
+      !candidate.pinnedTemplate ||
+      (candidate.draft && candidate.pinnedTemplate.draftRev !== candidate.draft.rev)
+    ) {
+      reasons.push('缺少与当前任务稿对应的固定模板');
+    }
+    if (candidate.activeRunId || runningCandidates.has(candidate.id)) {
+      reasons.push('候选仍有活动或执行中的 Run');
+    }
+    const mergeIntent = this.#readMergeIntentRecord(candidate.id);
+    if (mergeIntent.error) {
+      reasons.push(`合并意图状态文件无法读取，自动返修暂停：${mergeIntent.error}`);
+    } else if (mergeIntent.intent) {
+      reasons.push('存在未完成的合并意图，自动返修暂停');
+    }
+    if (!latest) {
+      reasons.push('候选没有可返修的当前交付');
+      return reasons;
+    }
+    if (latest.status !== 'awaiting_acceptance') {
+      reasons.push(`当前 Run 状态为 ${latest.status}，没有待返修交付`);
+    }
+    const controlRecord = this.#readControlRecord(latest.id);
+    if (controlRecord.error) {
+      reasons.push(`上次执行控制文件无法读取，自动返修暂停：${controlRecord.error}`);
+    }
+    const control = controlRecord.control;
+    if (
+      control?.spawn?.status === 'unknown' ||
+      control?.spawn?.status === 'starting' ||
+      control?.hold
+    ) {
+      reasons.push('上次执行进程状态不明或仍被占用，需先核对现场');
+    }
+    const draftRecord = this.#readDraftRecord(candidate.id);
+    if (draftRecord && AUTO_REPAIR_DRAFT_BLOCKING_STATES.has(draftRecord.state)) {
+      reasons.push(`只读整理仍占用（${draftRecord.state}），自动返修暂停`);
+    }
+    return reasons;
+  }
+
+  /** Latest recorded `changes_requested` for exactly this Run/head, or null. */
+  #autoRepairFeedback(candidate, run, headSha) {
+    if (!run || !headSha) {
+      return null;
+    }
+    let acceptances;
+    try {
+      acceptances = this.#wf.listAcceptances(candidate.id);
+    } catch {
+      return null;
+    }
+    const latestByRole = new Map();
+    for (const acceptance of acceptances) {
+      if (acceptance.runId !== run.id) {
+        continue;
+      }
+      if (acceptance.headSha.toLowerCase() !== headSha.toLowerCase()) {
+        continue;
+      }
+      latestByRole.set(acceptance.role, acceptance);
+    }
+    const feedback = [...latestByRole.values()].filter(
+      (acceptance) => acceptance.verdict === 'changes_requested',
+    );
+    return feedback.length > 0 ? feedback : null;
+  }
+
+  /**
+   * Runs before claiming on every tick. Only explicitly enabled policies with a
+   * locally recorded `changes_requested` for the current delivery are
+   * re-verified against GitHub; default/off/no-feedback candidates never cause a
+   * remote read. Returns the IDs whose queued automatic repair was verified for
+   * this round so `claimNext` cannot claim an unverified pending queue while
+   * unrelated manual tasks keep being considered.
+   */
+  async #verifyAutoRepairs() {
+    const workflow = this.#wf;
+    const allowlist = new Set();
+    let candidates;
+    let runningCandidates;
+    try {
+      candidates = workflow.listCandidates();
+      runningCandidates = new Set(
+        workflow
+          .listRuns()
+          .filter((run) => run.status === 'running')
+          .map((run) => run.candidateId),
+      );
+    } catch {
+      return allowlist;
+    }
+    for (const candidate of candidates) {
+      if (this.#closing) break;
+      let policy;
+      try {
+        policy = workflow.getAutoRepair(candidate.id);
+      } catch {
+        continue;
+      }
+      // Explicit opt-in only. Default/closed policies never cause a remote read.
+      if (!policy.enabled) {
+        continue;
+      }
+      if (!policy.pendingFromRunId && policy.used >= policy.limit) {
+        // Budget exhausted: no remote read and no new Run.
+        continue;
+      }
+      if (policy.pendingFromRunId === null && runningCandidates.has(candidate.id)) {
+        // The candidate is already executing; there is nothing to verify and no
+        // event to spam while its Run is active.
+        continue;
+      }
+      try {
+        if (await this.#verifyAutoRepairCandidate(policy, { runningCandidates })) {
+          allowlist.add(candidate.id);
+        }
+      } catch (error) {
+        this.#observeAutoRepairBlocked(policy, `自动返修核验异常：${errorMessage(error)}`, {});
+      }
+    }
+    return allowlist;
+  }
+
+  async #verifyAutoRepairCandidate(policy, { runningCandidates }) {
+    const workflow = this.#wf;
+    const id = policy.candidateId;
+    const candidate = workflow.getCandidate(id);
+    const latest = workflow.latestRun(id);
+    const pending = policy.pendingFromRunId !== null;
+    const latestPr = latest?.result?.pr ?? null;
+    const expectedHeadSha = pending ? policy.pendingHeadSha : (latestPr?.headSha ?? null);
+    const key = this.#autoRepairKey(policy, expectedHeadSha);
+
+    const localBlockers = this.#autoRepairLocalBlockers(candidate, latest, policy, {
+      runningCandidates,
+    });
+    if (localBlockers.length > 0) {
+      this.#handleAutoRepairBlocked(policy, localBlockers.join('；'), {
+        key,
+        headSha: expectedHeadSha,
+        pending,
+        drift: pending,
+      });
+      return false;
+    }
+
+    if (!latestPr || !expectedHeadSha) {
+      this.#observeAutoRepairBlocked(policy, '当前交付没有 PR，不能自动返修', {
+        key,
+        headSha: expectedHeadSha,
+        backoff: false,
+      });
+      return false;
+    }
+
+    // Feedback is a local fact: without a recorded `changes_requested` for this
+    // exact Run/head there is no automatic repair and no remote read at all.
+    const feedback = this.#autoRepairFeedback(candidate, latest, expectedHeadSha);
+    if (!feedback) {
+      if (pending) {
+        this.#cancelQueuedAutoRepair(
+          policy,
+          '当前交付已没有 changes_requested 验收，取消本次自动排队（预算保留）',
+        );
+        this.#autoRepairObserved.delete(id);
+      }
+      return false;
+    }
+
+    if (!this.#autoRepairGate(key).allowed) {
+      // Bounded backoff: no repeated network request or event this tick.
+      return false;
+    }
+
+    // Read-only refresh of the Issue source. A changed source revokes the
+    // decision and the persisted opt-in in the domain; a read failure never
+    // dispatches a Run and never consumes budget.
+    try {
+      const fresh = await this.#refreshSource(id);
+      if (fresh.changed) {
+        this.#observeAutoRepairBlocked(policy, 'Issue 内容已变化，自动返修授权已撤销', {
+          key,
+          headSha: expectedHeadSha,
+          backoff: false,
+        });
+        return false;
+      }
+    } catch (error) {
+      this.#recordAutoRepairReadFailure(
+        policy,
+        key,
+        expectedHeadSha,
+        `只读刷新 Issue 失败：${errorMessage(error)}`,
+        pending,
+      );
+      return false;
+    }
+
+    const refreshedPolicy = workflow.getAutoRepair(id);
+    if (!refreshedPolicy.enabled) {
+      this.#observeAutoRepairBlocked(refreshedPolicy, '自动返修策略已关闭，本轮不领取', {
+        key,
+        headSha: expectedHeadSha,
+      });
+      return false;
+    }
+    if (
+      refreshedPolicy.pendingFromRunId !== policy.pendingFromRunId ||
+      refreshedPolicy.pendingHeadSha !== policy.pendingHeadSha
+    ) {
+      this.#observeAutoRepairBlocked(refreshedPolicy, '自动返修排队已变化，本轮不再核验', {
+        key,
+        headSha: expectedHeadSha,
+      });
+      return false;
+    }
+
+    let live;
+    try {
+      live = await this.#readPullRequest(latestPr.repo, latestPr.number);
+    } catch (error) {
+      this.#recordAutoRepairReadFailure(
+        refreshedPolicy,
+        key,
+        expectedHeadSha,
+        `只读读取 PR 失败：${errorMessage(error)}`,
+        pending,
+      );
+      return false;
+    }
+    if (live.state !== 'open') {
+      this.#handleAutoRepairBlocked(refreshedPolicy, `PR 当前状态为 ${live.state}，不能自动返修`, {
+        key,
+        headSha: expectedHeadSha,
+        pending,
+        drift: true,
+      });
+      return false;
+    }
+    if (String(live.headSha).toLowerCase() !== String(expectedHeadSha).toLowerCase()) {
+      this.#handleAutoRepairBlocked(refreshedPolicy, 'PR head 已与登记交付不一致，不能自动返修', {
+        key,
+        headSha: expectedHeadSha,
+        pending,
+        drift: true,
+      });
+      return false;
+    }
+
+    // The remote read yielded; local facts may have changed meanwhile (an
+    // explicit draft, a new control/merge-intent fault). Re-run local-only
+    // safety before queueing or returning a claimable verification.
+    const localAfterRemote = this.#autoRepairLocalBlockers(
+      workflow.getCandidate(id),
+      workflow.latestRun(id),
+      refreshedPolicy,
+      { runningCandidates },
+    );
+    if (localAfterRemote.length > 0) {
+      this.#handleAutoRepairBlocked(refreshedPolicy, localAfterRemote.join('；'), {
+        key,
+        headSha: expectedHeadSha,
+        pending,
+        drift: pending,
+      });
+      return false;
+    }
+
+    if (pending) {
+      this.#clearAutoRepairBackoff(key);
+      this.#autoRepairObserved.delete(id);
+      return true;
+    }
+
+    let queued;
+    try {
+      queued = workflow.queueAutoRepair(id, {
+        expectedRunId: latest.id,
+        expectedHeadSha,
+      });
+    } catch (error) {
+      this.#recordAutoRepairReadFailure(
+        refreshedPolicy,
+        key,
+        expectedHeadSha,
+        `自动返修入队失败：${errorMessage(error)}`,
+        false,
+      );
+      return false;
+    }
+    if (!queued.queued) {
+      // A domain rejection (e.g. this Run was already consumed) is retried only
+      // after the bounded window, never with a GitHub read on every tick.
+      this.#observeAutoRepairBlocked(refreshedPolicy, queued.reason ?? '自动返修未入队', {
+        key,
+        headSha: expectedHeadSha,
+      });
+      return false;
+    }
+    this.#clearAutoRepairBackoff(key);
+    this.#autoRepairObserved.delete(id);
+    return true;
+  }
+
+  /**
+   * Re-reads local-only safety immediately before a synchronous claim. A
+   * verification performed before another await can be stale: an explicit draft
+   * may have started, a control/merge-intent file may be corrupt, or the Run may
+   * already be consumed. Only the already-verified pending repairs are filtered;
+   * unrelated manual `ready` candidates remain claimable.
+   */
+  #revalidateAutoRepairAllowlist(allowlist) {
+    const valid = new Set();
+    if (allowlist.size === 0) {
+      return valid;
+    }
+    let runningCandidates;
+    try {
+      runningCandidates = new Set(
+        this.#wf
+          .listRuns()
+          .filter((run) => run.status === 'running')
+          .map((run) => run.candidateId),
+      );
+    } catch {
+      return valid;
+    }
+    for (const id of allowlist) {
+      let policy;
+      let candidate;
+      let latest;
+      try {
+        policy = this.#wf.getAutoRepair(id);
+        candidate = this.#wf.getCandidate(id);
+        latest = this.#wf.latestRun(id);
+      } catch {
+        continue;
+      }
+      if (!policy.enabled || policy.pendingFromRunId === null) {
+        continue;
+      }
+      const reasons = this.#autoRepairLocalBlockers(candidate, latest, policy, {
+        runningCandidates,
+      });
+      if (reasons.length === 0) {
+        valid.add(id);
+        continue;
+      }
+      const expectedHeadSha = policy.pendingHeadSha ?? latest?.result?.pr?.headSha ?? null;
+      this.#handleAutoRepairBlocked(policy, reasons.join('；'), {
+        key: this.#autoRepairKey(policy, expectedHeadSha),
+        headSha: expectedHeadSha,
+        pending: true,
+        drift: true,
+      });
+    }
+    return valid;
+  }
+
+  // ---------------------------------------------------------------------
   // Tick
   // ---------------------------------------------------------------------
 
@@ -1497,11 +2102,21 @@ export class Runtime {
     }
 
     let claimed = 0;
+    // Automatic repairs are re-verified against the live PR/Issue before any
+    // claim. The allowlist is the exact set verified in this round, so a queued
+    // repair that failed or drifted can never be claimed through the generic
+    // path, while unrelated manual tasks keep being considered.
+    const autoRepairAllowlist = await this.#verifyAutoRepairs();
     for (;;) {
       if (this.#closing) break;
+      // Local safety is re-checked immediately before every synchronous claim.
+      // The previous round may have awaited draft/run advancement, so reusing the
+      // pre-await allowlist could claim a repair for a candidate whose draft has
+      // since started or whose local state became unreadable.
+      const claimableRepairs = this.#revalidateAutoRepairAllowlist(autoRepairAllowlist);
       let run;
       try {
-        run = workflow.claimNext();
+        run = workflow.claimNext({ autoRepairAllowlist: claimableRepairs });
       } catch (error) {
         workflow.recordEvent({
           kind: 'run.claim_failed',
@@ -1857,12 +2472,21 @@ export class Runtime {
     return path.join(this.#runDir(runId), 'control.json');
   }
 
-  #readControlSync(runId) {
+  /**
+   * Same read as `#readControlSync` but keeps the distinction between a missing
+   * file and a corrupt one so automatic claims can fail closed with a reason.
+   */
+  #readControlRecord(runId) {
     try {
-      return readJsonFile(this.#controlFile(runId));
-    } catch {
-      return null;
+      const control = readJsonFile(this.#controlFile(runId));
+      return { present: control !== null, control, error: null };
+    } catch (error) {
+      return { present: true, control: null, error: errorMessage(error) };
     }
+  }
+
+  #readControlSync(runId) {
+    return this.#readControlRecord(runId).control;
   }
 
   #writeControl(runId, control) {
@@ -2585,7 +3209,7 @@ export class Runtime {
       return httpError(404, 'not_found', message);
     }
     if (
-      /draftRev|任务稿版本|旧任务稿|旧版本|旧源内容|仍有执行中的 Run|仍有活动 Run|已完成|当前状态|失效|固定模板|拒绝合并|不允许记录合并|未命中收集规则/.test(
+      /draftRev|任务稿版本|旧任务稿|旧版本|旧源内容|仍有执行中的 Run|仍有活动 Run|已完成|当前状态|失效|授权|固定模板|拒绝合并|不允许记录合并|未命中收集规则/.test(
         message,
       )
     ) {

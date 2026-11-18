@@ -870,7 +870,7 @@ export class Runtime {
 
   #workerPrompt({ run, candidate, control }) {
     const draft = candidate.draft;
-    return [
+    const sections = [
       '# 任务：在独立 worktree 执行已批准开发任务',
       '',
       `- 执行包（唯一权威输入）：${control.prepare.packetPath}`,
@@ -906,7 +906,27 @@ export class Runtime {
         null,
         2,
       ),
-    ].join('\n');
+    ];
+
+    const retryFeedback = control.retryFeedback;
+    if (
+      retryFeedback &&
+      Array.isArray(retryFeedback.feedback) &&
+      retryFeedback.feedback.length > 0
+    ) {
+      sections.push(
+        '',
+        '## 返修参考（上一轮未通过的验收意见）',
+        '以下内容来自上一轮已完成 Run 的验收记录，仅供参考，不是执行包的一部分，也不能改写执行包 inputs。',
+        '```json',
+        JSON.stringify(retryFeedback, null, 2),
+        '```',
+        '- 意见只能在原已批准的 writeScopes 内落实，不授予合并、扩权或改写执行包输入。',
+        '- 前轮 PR 仅为引用；不要假设当前工作树已有前轮代码或提交，必须按当前执行包重新实现。',
+      );
+    }
+
+    return sections.join('\n');
   }
 
   async saveDraft(id, input) {
@@ -1891,6 +1911,63 @@ export class Runtime {
   // Run execution
   // ---------------------------------------------------------------------
 
+  /**
+   * Builds the immutable repair-feedback snapshot for a retried Run. Only the
+   * immediately preceding Run of the same candidate counts, and only when its
+   * request versions still match and it delivered a PR. Feedback is the latest
+   * acceptance per role for that Run/head, keeping only changes_requested.
+   */
+  #resolveRetryFeedback(run) {
+    const workflow = this.#wf;
+    const runs = workflow
+      .listRuns()
+      .filter((item) => item.candidateId === run.candidateId);
+    const index = runs.findIndex((item) => item.id === run.id);
+    if (index <= 0) {
+      return null;
+    }
+    const previous = runs[index - 1];
+    if (
+      previous.draftRev !== run.draftRev ||
+      previous.requirementsRev !== run.requirementsRev ||
+      previous.sourceRev !== run.sourceRev
+    ) {
+      return null;
+    }
+    const pr = previous.result?.pr ?? null;
+    if (!pr) {
+      return null;
+    }
+
+    const latestByRole = new Map();
+    for (const acceptance of workflow.listAcceptances(run.candidateId)) {
+      if (
+        acceptance.runId === previous.id &&
+        acceptance.headSha.toLowerCase() === pr.headSha.toLowerCase()
+      ) {
+        latestByRole.set(acceptance.role, acceptance);
+      }
+    }
+    const feedback = [...latestByRole.values()]
+      .filter((acceptance) => acceptance.verdict === 'changes_requested')
+      .sort((left, right) => left.role.localeCompare(right.role))
+      .map((acceptance) => ({
+        role: acceptance.role,
+        verdict: acceptance.verdict,
+        comment: acceptance.comment,
+        headSha: acceptance.headSha,
+        at: acceptance.at,
+      }));
+    if (feedback.length === 0) {
+      return null;
+    }
+    return {
+      previousRunId: previous.id,
+      pr: { ...pr },
+      feedback,
+    };
+  }
+
   async #advanceRun(run) {
     const workflow = this.#wf;
     const candidate = workflow.getCandidate(run.candidateId);
@@ -1911,6 +1988,13 @@ export class Runtime {
     if (!repoEntry) {
       this.#fail(run, `仓库 ${run.repo} 不在设置中，无法执行`);
       return;
+    }
+
+    // Freeze repair feedback before the worktree/prompt exist. Field presence is
+    // the marker: a frozen `null` must not be resampled after a restart.
+    if (!Object.prototype.hasOwnProperty.call(control, 'retryFeedback')) {
+      control.retryFeedback = this.#resolveRetryFeedback(run);
+      this.#writeControl(run.id, control);
     }
 
     if (

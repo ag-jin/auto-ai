@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 
 import { Runtime } from '../src/runtime.mjs';
+import { Store } from '../src/store.mjs';
 import { Workflow } from '../src/workflow.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -453,6 +454,29 @@ async function writeWorkerResult(dataDir, runId, value) {
   const file = path.join(dataDir, 'runs', runId, 'result.json');
   await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * Seeds an acceptance row directly. Used only to simulate verdict/history that
+ * the public API cannot create once a candidate has left awaiting_acceptance.
+ */
+function insertAcceptance(dataDir, input) {
+  const store = new Store(path.join(dataDir, 'workflow.db'));
+  try {
+    store.run(
+      `INSERT INTO acceptances (candidate_id, run_id, role, verdict, head_sha, comment, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      input.candidateId,
+      input.runId,
+      input.role,
+      input.verdict,
+      input.headSha,
+      input.comment,
+      input.at ?? new Date().toISOString(),
+    );
+  } finally {
+    store.close();
+  }
 }
 
 /**
@@ -2415,4 +2439,214 @@ test('全局仅一个槽位时，准备失败释放占用并继续安排另一�
   } finally {
     await runtime.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// RF001: changes_requested feedback must reach the retried worker prompt
+// ---------------------------------------------------------------------------
+
+test('RF001 返修重试的 Worker prompt 必须包含未通过的验收意见', async (t) => {
+  const env = await arrangeAwaitingAcceptance(t);
+  const { runtime, pi, dataDir, id, runId, pr, headSha } = env;
+  t.after(() => runtime.close());
+
+  const comment = 'RF001_UNIQUE_REPAIR: 配置标签规则并开启监督，禁止自动合并';
+  await runtime.recordAcceptance(id, {
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment,
+  });
+  await runtime.retry(id);
+  await runtime.tick();
+
+  const state = await runtime.getState();
+  const retriedRun = latestRunFor(state, id);
+  assert.ok(retriedRun, '返修重试后应产生新的 Run');
+  assert.notEqual(retriedRun.id, runId, '返修重试必须使用新的 Run ID');
+
+  const workerCall = pi.startCalls.find(
+    (call) => call.role === 'worker' && call.id === retriedRun.id,
+  );
+  assert.ok(workerCall, '返修重试应启动新的 Worker');
+  assert.ok(workerCall.prompt.includes(comment), '新 Worker 必须收到设计监督的返修意见');
+  assert.ok(workerCall.prompt.includes(runId), '新 Worker 应看到上一 Run 的 ID');
+  assert.ok(workerCall.prompt.includes(pr.url), '新 Worker 应看到上一结果的 PR');
+  assert.ok(workerCall.prompt.includes(headSha), '新 Worker 应看到上一结果的 head');
+
+  const readPacket = async (rid) =>
+    JSON.parse(await readFile(path.join(dataDir, 'runs', rid, 'packet.json'), 'utf8'));
+  const oldPacket = await readPacket(runId);
+  const newPacket = await readPacket(retriedRun.id);
+  assert.deepEqual(newPacket.inputs, oldPacket.inputs, '返修不得改变已批准的任务输入');
+  assert.equal(newPacket.requirements_rev, oldPacket.requirements_rev);
+  assert.equal(newPacket.template_ref, oldPacket.template_ref);
+  await runtime.close();
+});
+
+test('RF001 同一角色后来的 approved 覆盖旧 changes_requested，不再传递返修意见', async (t) => {
+  const env = await arrangeAwaitingAcceptance(t);
+  const { runtime, pi, dataDir, id, headSha } = env;
+  t.after(() => runtime.close());
+
+  const firstRunCall = pi.startCalls.find((call) => call.role === 'worker');
+  assert.ok(!firstRunCall.prompt.includes('返修参考'), '首次执行不带返修参考');
+
+  const rejected = 'RF001_REJECTED_THEN_APPROVED: 旧意见已被后来通过覆盖';
+  await runtime.recordAcceptance(id, {
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment: rejected,
+  });
+  await runtime.recordAcceptance(id, {
+    role: 'design',
+    verdict: 'approved',
+    headSha,
+    comment: 'RF001_LATER_APPROVED: 修复后的实现已通过',
+  });
+  await runtime.retry(id);
+  await runtime.tick();
+
+  const retriedRun = latestRunFor(await runtime.getState(), id);
+  const workerCall = pi.startCalls.find(
+    (call) => call.role === 'worker' && call.id === retriedRun.id,
+  );
+  assert.ok(workerCall);
+  assert.ok(!workerCall.prompt.includes(rejected));
+  assert.ok(!workerCall.prompt.includes('返修参考'));
+  assert.equal((await readControl(dataDir, retriedRun.id)).retryFeedback, null);
+  await runtime.close();
+});
+
+test('RF001 只取紧邻前轮同 head 的意见，旧 head、旧 Run 与其他候选不混入', async (t) => {
+  const env = await arrangeAwaitingAcceptance(t);
+  const { runtime, pi, dataDir, id, runId, headSha } = env;
+  t.after(() => runtime.close());
+
+  const oldHeadComment = 'RF001_OLD_HEAD: 旧 head 的意见不得进入新 Run';
+  const otherCandidateComment = 'RF001_OTHER_CANDIDATE: 其他候选的意见不得混入';
+  insertAcceptance(dataDir, {
+    candidateId: id,
+    runId,
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha: 'e'.repeat(40),
+    comment: oldHeadComment,
+  });
+  insertAcceptance(dataDir, {
+    candidateId: candidateId(2),
+    runId,
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment: otherCandidateComment,
+  });
+
+  const comment = 'RF001_NEAREST: 紧邻前轮当前 head 的有效返修意见';
+  await runtime.recordAcceptance(id, {
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment,
+  });
+  await runtime.retry(id);
+  await runtime.tick();
+
+  let state = await runtime.getState();
+  const retriedRun = latestRunFor(state, id);
+  const workerCall = pi.startCalls.find(
+    (call) => call.role === 'worker' && call.id === retriedRun.id,
+  );
+  assert.ok(workerCall);
+  assert.ok(workerCall.prompt.includes(comment));
+  assert.ok(!workerCall.prompt.includes(oldHeadComment), '旧 head 的意见不得混入');
+  assert.ok(!workerCall.prompt.includes(otherCandidateComment), '其他候选的意见不得混入');
+  const control = await readControl(dataDir, retriedRun.id);
+  assert.equal(control.retryFeedback.previousRunId, runId);
+  assert.equal(control.retryFeedback.pr.headSha, headSha);
+  assert.deepEqual(
+    control.retryFeedback.feedback.map((item) => item.comment),
+    [comment],
+  );
+
+  // The immediately preceding Run failed and never produced a PR. Retrying it
+  // must not skip back to the older run that still has a changes_requested.
+  pi.fail(retriedRun.id, 'RF001 模拟中间 Run 失败');
+  await runtime.tick();
+  state = await runtime.getState();
+  assert.equal(latestRunFor(state, id).status, 'blocked');
+  await runtime.retry(id);
+  await runtime.tick();
+
+  state = await runtime.getState();
+  const afterFailure = latestRunFor(state, id);
+  const afterFailureCall = pi.startCalls.find(
+    (call) => call.role === 'worker' && call.id === afterFailure.id,
+  );
+  assert.ok(afterFailureCall);
+  assert.ok(!afterFailureCall.prompt.includes(comment), '不得跨过失败 Run 去捞更老的意见');
+  assert.equal((await readControl(dataDir, afterFailure.id)).retryFeedback, null);
+  await runtime.close();
+});
+
+test('RF001 准备后冻结的返修快照在重入与重启后沿用，评论变化不重采样且只启动一次', async (t) => {
+  const env = await arrangeAwaitingAcceptance(t);
+  const { runtime, pi, dataDir, id, runId, headSha } = env;
+  const original = 'RF001_FROZEN_ORIGINAL: 冻结时的返修意见';
+  await runtime.recordAcceptance(id, {
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment: original,
+  });
+  await runtime.retry(id);
+  await runtime.tick();
+
+  const retriedRun = latestRunFor(await runtime.getState(), id);
+  const starts = () =>
+    pi.startCalls.filter((call) => call.role === 'worker' && call.id === retriedRun.id);
+  assert.equal(starts().length, 1);
+  assert.ok(starts()[0].prompt.includes(original));
+  const frozen = await readControl(dataDir, retriedRun.id);
+  assert.equal(frozen.retryFeedback.previousRunId, runId);
+  assert.equal(frozen.retryFeedback.feedback[0].comment, original);
+
+  // A later verdict and a simulated prepare re-entry must both reuse the frozen
+  // snapshot instead of sampling the new comment.
+  const later = 'RF001_FROZEN_LATER: 冻结后的评论不得重采样';
+  insertAcceptance(dataDir, {
+    candidateId: id,
+    runId,
+    role: 'design',
+    verdict: 'changes_requested',
+    headSha,
+    comment: later,
+  });
+  frozen.prepare = { ...frozen.prepare, status: 'preparing' };
+  frozen.spawn = { ...frozen.spawn, status: 'starting' };
+  await writeControl(dataDir, retriedRun.id, frozen);
+
+  await runtime.close();
+  const second = new Runtime({
+    dataDir,
+    appRepoDir: APP_REPO,
+    github: env.github,
+    pi,
+    workspace: env.workspace,
+    tickMs: 10,
+  });
+  runtimeDataDir.set(second, dataDir);
+  t.after(() => second.close());
+  await second.start();
+  await second.tick();
+
+  const afterRestart = await readControl(dataDir, retriedRun.id);
+  assert.equal(afterRestart.retryFeedback.feedback[0].comment, original);
+  assert.ok(!JSON.stringify(afterRestart.retryFeedback).includes(later));
+  const prompt = await readFile(path.join(dataDir, 'runs', retriedRun.id, 'prompt.md'), 'utf8');
+  assert.ok(prompt.includes(original));
+  assert.ok(!prompt.includes(later));
+  assert.equal(starts().length, 1, '新 Run 在重入与重启后不能再次启动');
+  await second.close();
 });

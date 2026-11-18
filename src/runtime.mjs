@@ -15,7 +15,7 @@ import { PiAdapter } from './pi-adapter.mjs';
 import { prepareTask } from './prepare-task.mjs';
 import { issueId, normalizeIssue } from './rules.mjs';
 import { ControllerLock, httpError, readJsonFile, writeJsonAtomic } from './runtime-state.mjs';
-import { listTemplates, resolveTemplate } from './template-adapter.mjs';
+import { isTemplateSourceError, listTemplates, resolveTemplate } from './template-adapter.mjs';
 import { Workflow } from './workflow.mjs';
 import { WorkspaceAdapter } from './workspace-adapter.mjs';
 
@@ -568,6 +568,12 @@ export class Runtime {
       });
       return { templates, templateListError: null };
     } catch (error) {
+      // Only known template configuration or Git read faults are declared as an
+      // unavailable list. An unexpected failure keeps flowing to the existing
+      // HTTP error handling instead of being reported as a source fault.
+      if (!isTemplateSourceError(error)) {
+        throw error;
+      }
       return {
         templates: [],
         templateListError: `开发模板列表不可用：${errorMessage(error)}`,

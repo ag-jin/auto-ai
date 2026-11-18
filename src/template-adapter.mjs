@@ -15,26 +15,45 @@ const ROLES = new Set(['worker', 'draft']);
 const RESERVED_ROLES = new Map([['requirements', 'draft']]);
 const MAX_BUFFER = 16 * 1024 * 1024;
 // A catalog entry that declares something invalid is an entry-level mistake:
-// tolerant callers may isolate it. A blob that Git cannot read is a source
-// fault and must never be turned into "this entry is absent".
+// tolerant callers may isolate it. A blob or commit that Git cannot read is a
+// source fault and must never be turned into "this entry is absent". Only the
+// explicit validation points below raise the "invalid" code; anything else
+// (unknown failures, Git read faults) keeps its own identity.
 const ENTRY_INVALID = 'template_entry_invalid';
 const BLOB_UNREADABLE = 'template_blob_unreadable';
+const GIT_UNREADABLE = 'template_git_unreadable';
+const KNOWN_FAILURE_CODES = new Set([ENTRY_INVALID, BLOB_UNREADABLE, GIT_UNREADABLE]);
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function entryConfigError(message) {
-  const error = new Error(message);
-  error.code = ENTRY_INVALID;
-  return error;
+/**
+ * Explicitly invalid template content (id, path, metadata, role, YAML text).
+ * Raised only where the adapter itself validates a declared value, so callers
+ * can tell it apart from a Git read fault or an unexpected failure.
+ */
+class TemplateConfigError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = 'TemplateConfigError';
+    this.code = ENTRY_INVALID;
+  }
 }
 
-function asEntryConfigError(error) {
-  if (error?.code === ENTRY_INVALID || error?.code === BLOB_UNREADABLE) {
-    return error;
-  }
-  return entryConfigError(String(error?.message ?? error));
+function configError(message) {
+  return new TemplateConfigError(message);
+}
+
+/** Known template-source failures that a caller may report as a list error. */
+export function isTemplateSourceError(error) {
+  return KNOWN_FAILURE_CODES.has(error?.code);
+}
+
+function gitSourceError(message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = GIT_UNREADABLE;
+  return error;
 }
 
 function errorDetail(error) {
@@ -54,11 +73,11 @@ function normalizeRole(value, label) {
     return 'worker';
   }
   if (typeof value !== 'string') {
-    throw new Error(`${label} role 必须是字符串`);
+    throw configError(`${label} role 必须是字符串`);
   }
   const role = value.trim();
   if (!ROLES.has(role)) {
-    throw new Error(`${label} role 必须是 worker 或 draft`);
+    throw configError(`${label} role 必须是 worker 或 draft`);
   }
   return role;
 }
@@ -105,39 +124,48 @@ function requireRef(ref) {
   return normalized;
 }
 
+// A hand-written catalog key is explicit input: an invalid id is a known
+// entry-level mistake, not an unknown failure. The message stays identical to
+// the generic string validation so the strict interface still reports why.
 function requireId(id) {
-  const normalized = requireTrimmedString(id, 'id');
+  if (typeof id !== 'string') {
+    throw configError('id 必须是字符串');
+  }
+  const normalized = id.trim();
+  if (normalized.length === 0) {
+    throw configError('id 不能为空');
+  }
   if (!ID_PATTERN.test(normalized)) {
-    throw new Error('id 只能包含字母、数字、点、下划线或连字符');
+    throw configError('id 只能包含字母、数字、点、下划线或连字符');
   }
   return normalized;
 }
 
 function validateTemplatePath(templatePath, label) {
   if (typeof templatePath !== 'string' || templatePath.length === 0) {
-    throw new Error(`${label} 必须是非空字符串`);
+    throw configError(`${label} 必须是非空字符串`);
   }
   if (templatePath.length > 300) {
-    throw new Error(`${label} 过长`);
+    throw configError(`${label} 过长`);
   }
   if (templatePath.includes('\\')) {
-    throw new Error(`${label} 必须使用正斜杠`);
+    throw configError(`${label} 必须使用正斜杠`);
   }
   if (templatePath.includes('\0')) {
-    throw new Error(`${label} 不能包含 NUL`);
+    throw configError(`${label} 不能包含 NUL`);
   }
   if (templatePath.startsWith('/') || /^[A-Za-z]:\//.test(templatePath)) {
-    throw new Error(`${label} 必须是仓库内相对路径`);
+    throw configError(`${label} 必须是仓库内相对路径`);
   }
   const segments = templatePath.split('/');
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
-    throw new Error(`${label} 不能包含空、. 或 .. 路径段`);
+    throw configError(`${label} 不能包含空、. 或 .. 路径段`);
   }
   if (segments[0] !== 'templates') {
-    throw new Error(`${label} 必须位于 templates/ 下`);
+    throw configError(`${label} 必须位于 templates/ 下`);
   }
   if (!templatePath.endsWith('.md')) {
-    throw new Error(`${label} 必须指向 .md 文件`);
+    throw configError(`${label} 必须指向 .md 文件`);
   }
   return templatePath;
 }
@@ -149,18 +177,18 @@ function validateTemplatePath(templatePath, label) {
  */
 function catalogDefaultToRepoPath(value, label) {
   if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new Error(`${label} 必须是非空字符串`);
+    throw configError(`${label} 必须是非空字符串`);
   }
   const raw = value.trim();
   if (raw.includes('\\') || raw.includes('\0')) {
-    throw new Error(`${label} 必须使用规范正斜杠相对路径`);
+    throw configError(`${label} 必须使用规范正斜杠相对路径`);
   }
   if (raw.startsWith('/') || /^[A-Za-z]:\//.test(raw)) {
-    throw new Error(`${label} 必须是仓库内相对路径`);
+    throw configError(`${label} 必须是仓库内相对路径`);
   }
   const segments = raw.split('/');
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
-    throw new Error(`${label} 不能包含空、. 或 .. 路径段`);
+    throw configError(`${label} 不能包含空、. 或 .. 路径段`);
   }
   const repoPath = segments[0] === 'templates' ? raw : `templates/${raw}`;
   return validateTemplatePath(repoPath, label);
@@ -174,58 +202,58 @@ function parseYaml(text, label) {
       .split('\n')
       .slice(0, 4)
       .join('\n');
-    throw new Error(`${label} YAML 非法：${message}`);
+    throw configError(`${label} YAML 非法：${message}`);
   }
 }
 
 function splitFrontMatter(text, label) {
   if (typeof text !== 'string') {
-    throw new Error(`${label} 必须是文本`);
+    throw configError(`${label} 必须是文本`);
   }
   const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
   if (!match) {
-    throw new Error(`${label} 缺少 YAML frontmatter`);
+    throw configError(`${label} 缺少 YAML frontmatter`);
   }
   const meta = parseYaml(match[1], `${label} frontmatter`);
   if (!isObject(meta)) {
-    throw new Error(`${label} frontmatter 必须是 YAML 对象`);
+    throw configError(`${label} frontmatter 必须是 YAML 对象`);
   }
   return meta;
 }
 
 function requireCatalog(catalog, label) {
   if (!isObject(catalog)) {
-    throw new Error(`${label} 必须是 YAML 对象`);
+    throw configError(`${label} 必须是 YAML 对象`);
   }
   if (catalog.schema_version !== 1) {
-    throw new Error(`${label} schema_version 必须为 1`);
+    throw configError(`${label} schema_version 必须为 1`);
   }
   if (!isObject(catalog.templates)) {
-    throw new Error(`${label} 缺少 templates 对象`);
+    throw configError(`${label} 缺少 templates 对象`);
   }
   return catalog;
 }
 
 function requireTemplateMeta(meta, { id, templatePath, label }) {
   if (meta.schema_version !== 1) {
-    throw new Error(`${label} schema_version 必须为 1`);
+    throw configError(`${label} schema_version 必须为 1`);
   }
   if (typeof meta.id !== 'string' || meta.id.trim().length === 0) {
-    throw new Error(`${label} 缺少模板 id`);
+    throw configError(`${label} 缺少模板 id`);
   }
   if (meta.id !== id) {
-    throw new Error(`${label} 的 id 为 ${meta.id}，与 catalog 的 ${id} 不一致`);
+    throw configError(`${label} 的 id 为 ${meta.id}，与 catalog 的 ${id} 不一致`);
   }
   if (typeof meta.version !== 'string' || meta.version.trim().length === 0) {
-    throw new Error(`${label} 缺少模板版本`);
+    throw configError(`${label} 缺少模板版本`);
   }
   if (!VERSION_PATTERN.test(meta.version)) {
-    throw new Error(`${label} 的版本格式无效：${meta.version}`);
+    throw configError(`${label} 的版本格式无效：${meta.version}`);
   }
   const role = normalizeRole(meta.role, label);
   const expectedPath = `templates/${id}/${meta.version}.md`;
   if (templatePath !== expectedPath) {
-    throw new Error(
+    throw configError(
       `${label} 路径 ${templatePath} 与 id/版本不一致，应为 ${expectedPath}`,
     );
   }
@@ -242,16 +270,14 @@ async function resolveCommit({ repoDir, ref, run }) {
       { maxBuffer: MAX_BUFFER },
     );
   } catch (error) {
-    const detail = String(error?.stderr || error?.message || '')
-      .trim()
-      .split('\n')
-      .slice(0, 4)
-      .join('\n');
-    throw new Error(`解析 ref ${normalizedRef} 失败：${detail || '未知错误'}`);
+    throw gitSourceError(
+      `解析 ref ${normalizedRef} 失败：${errorDetail(error) || '未知错误'}`,
+      error,
+    );
   }
   const commit = result.stdout.trim();
   if (!COMMIT_PATTERN.test(commit)) {
-    throw new Error(`ref ${normalizedRef} 没有解析到完整提交 SHA`);
+    throw gitSourceError(`ref ${normalizedRef} 没有解析到完整提交 SHA`);
   }
   return commit;
 }
@@ -263,8 +289,11 @@ async function readBlob({ repoDir, commit, blobPath, run, label }) {
     });
     return result.stdout;
   } catch (error) {
+    // Keep the original Git failure as `cause` so the `cat-file` reason is never
+    // masked, and let tolerant callers probe the tree only when they must.
     const readError = new Error(
       `${label} 在提交 ${commit} 中读取失败（路径不存在或对象不可读）：${errorDetail(error) || '未知错误'}`,
+      { cause: error },
     );
     readError.code = BLOB_UNREADABLE;
     readError.blobPath = blobPath;
@@ -292,6 +321,7 @@ async function templatePathInTree({ repoDir, commit, blobPath, run, label }) {
   } catch (error) {
     const treeError = new Error(
       `${label} 在提交 ${commit} 中读取失败，且 git ls-tree 无法确认该路径是否存在：${errorDetail(error) || '未知错误'}`,
+      { cause: error },
     );
     treeError.code = BLOB_UNREADABLE;
     throw treeError;
@@ -317,17 +347,14 @@ async function loadTemplate({ repoDir, commit, id, templatePath, run }) {
     run,
     label: `模板 ${templatePath}`,
   });
-  let validated;
-  try {
-    const meta = splitFrontMatter(text, `模板 ${templatePath}`);
-    validated = requireTemplateMeta(meta, {
-      id,
-      templatePath,
-      label: `模板 ${templatePath}`,
-    });
-  } catch (error) {
-    throw asEntryConfigError(error);
-  }
+  // Validation errors already carry the explicit config code; no wrapping catch
+  // may relabel an unexpected failure as a skippable entry.
+  const meta = splitFrontMatter(text, `模板 ${templatePath}`);
+  const validated = requireTemplateMeta(meta, {
+    id,
+    templatePath,
+    label: `模板 ${templatePath}`,
+  });
   return { text, version: validated.version, role: validated.role };
 }
 
@@ -337,20 +364,14 @@ async function loadTemplate({ repoDir, commit, id, templatePath, run }) {
  * must agree with the template frontmatter.
  */
 async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRole }) {
-  let templatePath;
-  let catalogRole;
-  try {
-    templatePath = catalogDefaultToRepoPath(
-      entry.default,
-      `模板 ${id} 的 catalog default`,
-    );
-    catalogRole =
-      entry.role === undefined
-        ? null
-        : normalizeRole(entry.role, `模板 ${id} 的 catalog`);
-  } catch (error) {
-    throw asEntryConfigError(error);
-  }
+  const templatePath = catalogDefaultToRepoPath(
+    entry.default,
+    `模板 ${id} 的 catalog default`,
+  );
+  const catalogRole =
+    entry.role === undefined
+      ? null
+      : normalizeRole(entry.role, `模板 ${id} 的 catalog`);
   const template = await loadTemplate({
     repoDir,
     commit,
@@ -359,18 +380,18 @@ async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRo
     run,
   });
   if (catalogRole !== null && catalogRole !== template.role) {
-    throw entryConfigError(
+    throw configError(
       `模板 ${id} 的 catalog role ${catalogRole} 与模板 role ${template.role} 不一致`,
     );
   }
   const reservedRole = RESERVED_ROLES.get(id);
   if (reservedRole !== undefined && template.role !== reservedRole) {
-    throw entryConfigError(
+    throw configError(
       `模板 ${id} 的 role 为 ${template.role}，保留 ID 的 role 必须为 ${reservedRole}`,
     );
   }
   if (expectedRole !== null && template.role !== expectedRole) {
-    throw entryConfigError(
+    throw configError(
       `模板 ${id} 的 role 为 ${template.role}，不能作为 ${expectedRole} 模板`,
     );
   }
@@ -453,10 +474,10 @@ export async function listTemplates({
     try {
       templateId = requireId(id);
       if (!isObject(entry)) {
-        throw entryConfigError(`模板 catalog 中 ${templateId} 的条目不是对象`);
+        throw configError(`模板 catalog 中 ${templateId} 的条目不是对象`);
       }
       if (entry.description !== undefined && typeof entry.description !== 'string') {
-        throw entryConfigError(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
+        throw configError(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
       }
       template = await resolveCatalogEntry({
         repoDir: normalizedRepoDir,
@@ -480,11 +501,10 @@ export async function listTemplates({
           label: `模板 ${error.blobPath}`,
         });
         if (inTree) {
-          // The tree lists the path, so this is a Git read fault, not an
-          // absent entry: keep the original reason and fail the whole list.
-          throw new Error(
-            `${error.message}；git ls-tree 证实该路径存在于提交 ${commit} 的树中，属于读取失败而非缺失条目`,
-          );
+          // The tree lists the path, so this is a Git read fault, not an absent
+          // entry. The error already carries the `cat-file` reason and cause;
+          // wrapping it again would only hide that.
+          throw error;
         }
         // The fixed commit tree proves the path is absent: entry-level mistake.
         continue;

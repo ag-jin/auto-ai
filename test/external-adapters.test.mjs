@@ -1496,3 +1496,31 @@ test('容错枚举只吸收条目级配置错误，catalog 与对象读取故障
     /templates\/research\/1\.0\.0\.md 在提交 .* 中读取失败/,
   );
 });
+
+test('手写非法 catalog key 是已知条目错误：严格接口报原因，工作台仍列出合法模板', async (t) => {
+  // A real catalog can carry a hand-written key like "typo id" next to a valid
+  // development entry. `requireId` validates explicit input, so that mistake is
+  // a known entry-level configuration error and stays isolatable. Treating it as
+  // an unknown failure would empty the workbench development list again.
+  const repo = await makeTemplateRepo(t, {
+    catalog: `${VALID_CATALOG}  typo id:
+    description: 手写键名含空格
+    default: development/1.0.0.md
+`,
+  });
+
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD' }),
+    (error) =>
+      error.code === 'template_entry_invalid' &&
+      /id 只能包含字母、数字、点、下划线或连字符/.test(error.message ?? ''),
+  );
+
+  const isolated = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    role: 'worker',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(isolated.map((item) => item.id), ['development', 'research']);
+});

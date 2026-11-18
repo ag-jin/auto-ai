@@ -558,6 +558,9 @@ export class Runtime {
         repoDir: this.#appRepoDir,
         ref: 'HEAD',
         role: 'worker',
+        // The workbench overview opts in: one malformed entry must not empty
+        // the development template list. Every other caller stays strict.
+        skipInvalidEntries: true,
       });
     } catch {
       return [];

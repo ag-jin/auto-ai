@@ -1414,12 +1414,34 @@ templates:
     /broken\/1\.0\.0\.md 在提交 .* 中不存在或无法读取/,
   );
 
-  // One broken entry must not clear the other valid worker templates.
-  const workerOnly = await listTemplates({ repoDir: repo.repo, ref: 'HEAD', role: 'worker' });
+  // Compatibility: the generic list stays strict, so existing callers and the
+  // T003B contract keep surfacing invalid metadata as an error. The first
+  // sorted entry `baddefault` has the illegal `../evil.md` path.
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD', role: 'worker' }),
+    /模板 baddefault 的 catalog default 不能包含空、\. 或 \.\. 路径段/,
+  );
+  await assert.rejects(
+    () => listTemplates({ repoDir: repo.repo, ref: 'HEAD' }),
+    /模板 baddefault 的 catalog default 不能包含空、\. 或 \.\. 路径段/,
+  );
+
+  // Only the workbench development list opts into per-entry isolation: one
+  // broken entry must not clear the other valid worker templates.
+  const workerOnly = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    role: 'worker',
+    skipInvalidEntries: true,
+  });
   assert.deepEqual(workerOnly.map((item) => item.id), ['development', 'research']);
-  const all = await listTemplates({ repoDir: repo.repo, ref: 'HEAD' });
+  const isolatedAll = await listTemplates({
+    repoDir: repo.repo,
+    ref: 'HEAD',
+    skipInvalidEntries: true,
+  });
   assert.deepEqual(
-    all.map((item) => `${item.id}:${item.role}`),
+    isolatedAll.map((item) => `${item.id}:${item.role}`),
     ['development:worker', 'research:worker'],
   );
 });

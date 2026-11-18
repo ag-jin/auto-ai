@@ -356,12 +356,20 @@ export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run, expected
  * Lists template defaults at exactly one commit, optionally filtered by role so
  * the development UI only offers worker execution templates.
  *
- * A broken entry (bad default path, missing file, invalid or conflicting role,
- * invalid metadata) is reported as an error by `resolveTemplate`, but it must
- * not hide the remaining valid entries: it is skipped here and never returned.
- * A repository whose catalog itself cannot be read still fails the whole call.
+ * The default contract stays strict and backward compatible: a broken entry
+ * (bad default path, missing file, invalid or conflicting role, invalid
+ * metadata) fails the whole call, exactly like `resolveTemplate`. Callers that
+ * render an overview may pass `skipInvalidEntries: true` to isolate such an
+ * entry and keep the remaining valid ones. A repository whose catalog itself
+ * cannot be read still fails the whole call in both modes.
  */
-export async function listTemplates({ repoDir, ref = 'HEAD', run, role } = {}) {
+export async function listTemplates({
+  repoDir,
+  ref = 'HEAD',
+  run,
+  role,
+  skipInvalidEntries = false,
+} = {}) {
   const normalizedRepoDir = path.resolve(requireTrimmedString(repoDir, 'repoDir'));
   const expectedRole =
     role === undefined || role === null ? null : normalizeRole(role, 'role');
@@ -390,8 +398,12 @@ export async function listTemplates({ repoDir, ref = 'HEAD', run, role } = {}) {
         run: runner,
         expectedRole: null,
       });
-    } catch {
-      // Per-entry isolation: one invalid template never clears the others.
+    } catch (error) {
+      if (!skipInvalidEntries) {
+        // Strict default: an invalid entry is reported, not silently dropped.
+        throw error;
+      }
+      // Opt-in per-entry isolation: one invalid template never clears the others.
       continue;
     }
     if (expectedRole !== null && template.role !== expectedRole) {

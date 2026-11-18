@@ -1649,6 +1649,7 @@ function renderCandidateDetail(candidate) {
 
   container.append(renderDraftSection(candidate, draft, draftEntry, editable));
   container.append(renderDecisionSection(candidate, draft, draftEntry));
+  container.append(renderAutoRepairSection(candidate));
   container.append(renderCandidateProgress(candidate));
   return container;
 }
@@ -2051,6 +2052,151 @@ function decisionCommonBlockers(candidate) {
 
 function decisionPending(id) {
   return ["develop", "defer", "ignore"].some((action) => ui.pending.has(`decision:${id}:${action}`));
+}
+
+function autoRepairKey(id) {
+  return `auto-repair:${id}`;
+}
+
+function autoRepairEnableBlockers(candidate, autoRepair) {
+  const blockers = [];
+  if (!autoRepair || typeof autoRepair !== "object") {
+    return ["服务端未提供自动返修状态"];
+  }
+  if (autoRepair.enabled === true) {
+    return ["自动返修已开启"];
+  }
+  const savedRev = str(candidate.draft?.rev);
+  const entry = ui.drafts.get(candidate.id);
+  if (candidate.filter?.matched !== true) blockers.push("该条目未命中收集规则");
+  if (autoRepair.authorized !== true) blockers.push("当前任务稿没有有效用户开发授权");
+  if (!savedRev) blockers.push("尚未保存任务稿版本");
+  if (candidate.draftStale) blockers.push("Issue 内容已变化，任务稿已失效");
+  if (entry?.dirty) blockers.push("有未保存的任务稿修改，请先保存");
+  if (savedRev && str(autoRepair.draftRev) !== savedRev) {
+    blockers.push("自动返修绑定的任务稿版本与当前保存版本不一致，请刷新后核对");
+  }
+  if (finiteNumber(autoRepair.remaining, 0) <= 0) blockers.push("自动返修剩余次数为 0");
+  if (!hasToken()) blockers.push("本地会话令牌不可用");
+  return unique(blockers);
+}
+
+function renderAutoRepairSection(candidate) {
+  const autoRepair =
+    candidate.autoRepair && typeof candidate.autoRepair === "object" ? candidate.autoRepair : null;
+  const key = autoRepairKey(candidate.id);
+  const pending = ui.pending.has(key);
+  const error = ui.errors.get(key);
+  const section = h("div", { class: "section", dataset: { autoRepair: candidate.id } });
+
+  section.append(
+    h(
+      "div",
+      { class: "section-head" },
+      h("h4", {}, "自动返修"),
+      autoRepair
+        ? badge(autoRepair.enabled === true ? "已开启" : "未开启", autoRepair.enabled === true ? "is-accent" : "")
+        : badge("不可用", "is-warn"),
+    ),
+  );
+
+  if (!autoRepair) {
+    section.append(
+      h(
+        "p",
+        { class: "hint" },
+        "服务端未提供自动返修状态，当前不可用；前端不会自行推断开关、次数或授权。",
+      ),
+    );
+    if (error) section.append(h("p", { class: "form-error" }, error));
+    return section;
+  }
+
+  const box = h("div", { class: "auto-repair-box" });
+  const limit = finiteNumber(autoRepair.limit, 2);
+  const used = finiteNumber(autoRepair.used, 0);
+  const remaining = finiteNumber(autoRepair.remaining, Math.max(0, limit - used));
+  box.append(
+    h(
+      "p",
+      { class: "auto-repair-status" },
+      h("strong", {}, autoRepair.enabled === true ? "状态：已开启" : "状态：未开启"),
+      h("span", { class: "mono" }, `已用 ${used} / 上限 ${limit} · 剩余 ${remaining}`),
+      autoRepair.authorized === true ? h("span", {}, "当前任务稿授权有效") : h("span", {}, "当前任务稿授权无效"),
+    ),
+  );
+  box.append(
+    h("p", { class: "hint" }, `服务端说明：${str(autoRepair.reason) || "未提供原因"}`),
+  );
+  if (autoRepair.pendingFromRunId) {
+    box.append(
+      h(
+        "p",
+        { class: "hint" },
+        `已自动排队等待领取（来源 Run ${str(autoRepair.pendingFromRunId)}${autoRepair.pendingHeadSha ? `，head ${shortRev(autoRepair.pendingHeadSha)}` : ""}）。`,
+      ),
+    );
+  }
+  if (autoRepair.blockedReason) {
+    box.append(h("p", { class: "form-warn" }, `服务端暂停原因：${str(autoRepair.blockedReason)}`));
+  }
+  if (autoRepair.nextAttemptAt) {
+    box.append(h("p", { class: "hint" }, `服务端建议下次核验：${fmtTime(autoRepair.nextAttemptAt)}`));
+  }
+  box.append(
+    h(
+      "p",
+      { class: "hint" },
+      `默认关闭；每个任务最多自动返修 ${limit} 次，只消费已明确记录的“要求修改”意见。` +
+        "自动返修不会自动批准、不会自动合并，也不替代用户决定。" +
+        "关闭不会停止当前正在运行的 Worker，也不会退回已消费次数。",
+    ),
+  );
+
+  if (autoRepair.enabled === true) {
+    box.append(
+      h(
+        "div",
+        { class: "btn-row" },
+        h(
+          "button",
+          {
+            type: "button",
+            class: "btn",
+            disabled: pending || !hasToken(),
+            onclick: () => setAutoRepair(candidate, false),
+          },
+          pending ? "处理中…" : "关闭自动返修",
+        ),
+      ),
+    );
+  } else {
+    const blockers = autoRepairEnableBlockers(candidate, autoRepair);
+    box.append(
+      h(
+        "div",
+        { class: "btn-row" },
+        h(
+          "button",
+          {
+            type: "button",
+            class: "btn btn-primary",
+            disabled: blockers.length > 0 || pending,
+            title: blockers.length ? blockers.join("；") : "绑定当前已保存任务稿版本并请求服务端核验",
+            onclick: () => setAutoRepair(candidate, true),
+          },
+          pending ? "处理中…" : "开启自动返修",
+        ),
+      ),
+    );
+    if (blockers.length) {
+      box.append(h("p", { class: "hint" }, `开启受限：${blockers.join("；")}`));
+    }
+  }
+  if (error) box.append(h("p", { class: "form-error" }, error));
+
+  section.append(box);
+  return section;
 }
 
 function renderDecisionSection(candidate, draft, entry) {
@@ -2957,6 +3103,7 @@ function renderAcceptanceDetail(candidate) {
     ),
   );
 
+  container.append(renderAutoRepairSection(candidate));
   container.append(renderMergeBox(candidate, pr, reviews));
   return container;
 }
@@ -3898,6 +4045,46 @@ async function decide(candidate, action) {
       ignore: "已忽略该候选需求。",
     };
     setNotice("ok", messages[action] || "决定已提交。");
+  });
+}
+
+async function setAutoRepair(candidate, enabled) {
+  if (!ensureToken()) return;
+  const current = candidateById(candidate.id) || candidate;
+  const autoRepair =
+    current.autoRepair && typeof current.autoRepair === "object" ? current.autoRepair : null;
+  const key = autoRepairKey(current.id);
+  let body;
+  if (enabled) {
+    const blockers = autoRepairEnableBlockers(current, autoRepair);
+    if (blockers.length) {
+      ui.errors.set(key, blockers.join("；"));
+      render();
+      return;
+    }
+    body = { enabled: true, draftRev: str(current.draft?.rev) };
+  } else {
+    // Disabling never depends on authorization, draft revision, budget or state.
+    body = { enabled: false };
+  }
+  await runAction(key, async () => {
+    try {
+      await api(`/api/candidates/${encodeURIComponent(current.id)}/auto-repair`, {
+        method: "PUT",
+        body,
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.status) {
+        error.message = `HTTP ${error.status}：${error.message || "请求失败"}`;
+      }
+      throw error;
+    }
+    setNotice(
+      "ok",
+      enabled
+        ? "已请求开启自动返修；服务端会重新核验来源、授权与剩余次数，设置本身不派发。"
+        : "已请求关闭自动返修；已消费次数不会退回，正在运行的 Worker 不会被停止。",
+    );
   });
 }
 

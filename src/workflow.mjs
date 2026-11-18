@@ -15,6 +15,7 @@ const DECISION_ACTIONS = new Set(['develop', 'defer', 'ignore']);
 const ACCEPTANCE_ROLES = new Set(['user', 'design']);
 const ACCEPTANCE_VERDICTS = new Set(['approved', 'changes_requested']);
 const ACTIVE_RUN_STATUS = 'running';
+const AUTO_REPAIR_LIMIT = 2;
 const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const TEMPLATE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TEMPLATE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
@@ -571,6 +572,12 @@ export class Workflow {
             }
             this.#store.run('DELETE FROM acceptances WHERE candidate_id = ?', id);
             this.#store.run('UPDATE candidates SET pinned_template = NULL WHERE id = ?', id);
+            this.#clearAutoRepairPendingForCandidate(id, at);
+            this.#revokeAutoRepairPolicies(
+              candidateFromRow(existing),
+              at,
+              'Issue 源内容变化，撤销旧的自动返修开启状态',
+            );
           }
 
           this.#store.run(
@@ -693,6 +700,19 @@ export class Workflow {
         activeRow && activeRow.status === ACTIVE_RUN_STATUS ? 'running' : 'awaiting_decision';
 
       this.#store.run('DELETE FROM acceptances WHERE candidate_id = ?', id);
+      this.#clearAutoRepairPendingForCandidate(id, at);
+      this.#revokeAutoRepairPolicies(
+        candidate,
+        at,
+        `任务稿版本 ${version} 变化，撤销旧的自动返修开启状态`,
+        {
+          keepIdentity: {
+            draftRev: draft.rev,
+            requirementsRev: draft.requirementsRev,
+            sourceRev: candidate.sourceRev,
+          },
+        },
+      );
       this.#store.run(
         `UPDATE candidates
            SET draft = ?, draft_rev = ?, draft_version = ?, draft_stale = 0,
@@ -818,6 +838,14 @@ export class Workflow {
         'user',
         at,
       );
+      if (action !== 'develop') {
+        this.#clearAutoRepairPendingForCandidate(id, at);
+        this.#revokeAutoRepairPolicies(
+          candidate,
+          at,
+          `用户决定 ${action}，撤销该候选的自动返修开启状态`,
+        );
+      }
       this.#store.appendEvent({
         at,
         kind: 'decision.recorded',
@@ -848,12 +876,39 @@ export class Workflow {
     return this.#evaluateEligibility(this.#requireCandidateRow(id));
   }
 
-  claimNext() {
+  /**
+   * Claims at most one eligible `ready` candidate.
+   *
+   * `options.autoRepairAllowlist` is optional and only narrows automatic
+   * repairs: given the candidate IDs whose external PR/source were re-verified
+   * in this round, a queued automatic repair that is NOT in the allowlist is
+   * left queued for the next round instead of being claimed through the generic
+   * path. Omitting the option keeps the pure domain semantics (local re-check
+   * only), so existing callers and unit checks are unchanged. Manual `ready`
+   * candidates carry no pending auto marker and are never affected.
+   */
+  claimNext(options = {}) {
+    if (!isObject(options)) {
+      throw new Error('claimNext 选项必须是对象');
+    }
+    const autoRepairAllowlist =
+      options.autoRepairAllowlist === undefined || options.autoRepairAllowlist === null
+        ? null
+        : new Set(options.autoRepairAllowlist);
     return this.#store.transaction(() => {
       const rows = this.#store.all(
         "SELECT * FROM candidates WHERE state = 'ready' ORDER BY priority DESC, rowid ASC",
       );
-      for (const row of rows) {
+      for (const snapshot of rows) {
+        // Re-read because an earlier iteration may have cancelled a queued auto repair.
+        const row = this.#store.get('SELECT * FROM candidates WHERE id = ?', snapshot.id);
+        if (!row || row.state !== 'ready') {
+          continue;
+        }
+        const autoRepairRow = this.#guardAutoRepairClaim(row, { autoRepairAllowlist });
+        if (autoRepairRow === 'cancelled' || autoRepairRow === 'deferred') {
+          continue;
+        }
         const evaluation = this.#evaluateEligibility(row);
         if (!evaluation.eligible) {
           continue;
@@ -898,6 +953,26 @@ export class Workflow {
             priority: draft.priority,
           },
         });
+        if (autoRepairRow) {
+          this.#clearAutoRepairPendingRow(autoRepairRow, at);
+          const identity = this.#autoRepairIdentity(candidate);
+          this.#store.appendEvent({
+            at,
+            kind: 'auto_repair.claimed',
+            message:
+              `候选 ${candidate.id} 的自动返修已领取，新建 Run ${runId}` +
+              `（来源 Run ${autoRepairRow.pending_run_id}）`,
+            candidateId: candidate.id,
+            runId,
+            repo: candidate.issue.repo,
+            data: {
+              fromRunId: autoRepairRow.pending_run_id,
+              headSha: autoRepairRow.pending_head_sha,
+              used: this.#autoRepairUsed(identity),
+              limit: autoRepairRow.limit_value,
+            },
+          });
+        }
         return runFromRow(this.#store.get('SELECT * FROM runs WHERE id = ?', runId));
       }
       return null;
@@ -1279,6 +1354,323 @@ export class Workflow {
     });
   }
 
+  /**
+   * Bounded automatic repair policy, scoped to one
+   * candidate + draftRev + requirementsRev + sourceRev identity. A new draft or
+   * source revision starts disabled; the consumption ledger keeps the used
+   * budget stable even if the policy row is deleted or toggled.
+   */
+  getAutoRepair(id) {
+    const candidate = candidateFromRow(this.#requireCandidateRow(id));
+    return this.#describeAutoRepair(candidate);
+  }
+
+  setAutoRepair(id, input) {
+    if (!isObject(input)) {
+      throw new Error('自动返修设置必须是对象');
+    }
+    if (typeof input.enabled !== 'boolean') {
+      throw new Error('autoRepair.enabled 必须是布尔值');
+    }
+
+    return this.#store.transaction(() => {
+      const candidate = candidateFromRow(this.#requireCandidateRow(id));
+      const identity = this.#autoRepairIdentity(candidate);
+      if (!identity) {
+        if (input.enabled) {
+          throw new Error(`候选 ${id} 还没有任务稿，不能开启自动返修`);
+        }
+        return this.#describeAutoRepair(candidate);
+      }
+      const at = now();
+
+      if (input.enabled) {
+        const draftRev = requireTrimmedString(input.draftRev, 'draftRev');
+        if (draftRev !== identity.draftRev) {
+          throw new Error('自动返修只能绑定当前任务稿版本，拒绝旧版本开启');
+        }
+        if (!candidate.filter.matched) {
+          throw new Error(`候选 ${id} 未命中收集规则，不能开启自动返修`);
+        }
+        if (candidate.draftStale) {
+          throw new Error(`候选 ${id} 的任务稿已失效，不能开启自动返修`);
+        }
+        if (!hasValidDevelopDecision(candidate)) {
+          throw new Error(`候选 ${id} 没有与当前任务稿一致的用户开发授权，不能开启自动返修`);
+        }
+        const existing = this.#autoRepairPolicyRow(candidate);
+        if (existing) {
+          // Enabling never resets the consumption counter.
+          this.#store.run(
+            `UPDATE auto_repair_policies
+                SET enabled = 1, updated_at = ?
+              WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+            at,
+            identity.candidateId,
+            identity.draftRev,
+            identity.requirementsRev,
+            identity.sourceRev,
+          );
+        } else {
+          this.#store.run(
+            `INSERT INTO auto_repair_policies
+               (candidate_id, draft_rev, requirements_rev, source_rev, enabled,
+                limit_value, pending_run_id, pending_head_sha, pending_at,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?)`,
+            identity.candidateId,
+            identity.draftRev,
+            identity.requirementsRev,
+            identity.sourceRev,
+            AUTO_REPAIR_LIMIT,
+            at,
+            at,
+          );
+        }
+        this.#store.appendEvent({
+          at,
+          kind: 'auto_repair.enabled',
+          message:
+            `候选 ${id} 开启自动返修（上限 ${AUTO_REPAIR_LIMIT}，已用 ` +
+            `${this.#autoRepairUsed(identity)}）；设置本身不派发`,
+          candidateId: id,
+          repo: candidate.issue.repo,
+          data: { ...identity, used: this.#autoRepairUsed(identity), limit: AUTO_REPAIR_LIMIT },
+        });
+      } else {
+        const existing = this.#autoRepairPolicyRow(candidate);
+        if (existing?.pending_run_id) {
+          this.#cancelAutoRepairPending(
+            candidate,
+            existing,
+            `自动返修已关闭，取消尚未领取的自动排队（来源 Run ${existing.pending_run_id}）`,
+          );
+        }
+        if (existing) {
+          this.#store.run(
+            `UPDATE auto_repair_policies
+                SET enabled = 0, updated_at = ?
+              WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+            at,
+            identity.candidateId,
+            identity.draftRev,
+            identity.requirementsRev,
+            identity.sourceRev,
+          );
+        }
+        this.#store.appendEvent({
+          at,
+          kind: 'auto_repair.disabled',
+          message:
+            `候选 ${id} 关闭自动返修；已消费次数保守保留 ` +
+            `${this.#autoRepairUsed(identity)}，不回退`,
+          candidateId: id,
+          repo: candidate.issue.repo,
+          data: { ...identity, used: this.#autoRepairUsed(identity), limit: AUTO_REPAIR_LIMIT },
+        });
+      }
+
+      return this.#describeAutoRepair(candidateFromRow(this.#requireCandidateRow(id)));
+    });
+  }
+
+  /**
+   * Queues exactly one bounded automatic repair for the currently delivered
+   * Run/head. Every rejection is a safe skip and never consumes budget. The
+   * actual claim re-verifies the policy, decision, review and delivery binding.
+   */
+  queueAutoRepair(id, input) {
+    if (!isObject(input)) {
+      throw new Error('自动返修排队信息必须是对象');
+    }
+    const expectedRunId = requireTrimmedString(input.expectedRunId, 'expectedRunId');
+    const expectedHeadSha = requireTrimmedString(input.expectedHeadSha, 'expectedHeadSha');
+
+    return this.#store.transaction(() => {
+      const candidate = candidateFromRow(this.#requireCandidateRow(id));
+      const identity = this.#autoRepairIdentity(candidate);
+      const skip = (reason) => ({
+        queued: false,
+        candidateId: candidate.id,
+        reason,
+        used: this.#autoRepairUsed(identity),
+      });
+
+      if (!identity) {
+        return skip('候选还没有任务稿，不能自动返修');
+      }
+      const policy = this.#autoRepairPolicyRow(candidate);
+      const used = this.#autoRepairUsed(identity);
+      const limit = policy ? policy.limit_value : AUTO_REPAIR_LIMIT;
+
+      const consumed = this.#store.get(
+        `SELECT id FROM auto_repair_consumptions
+          WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ?
+            AND source_rev = ? AND from_run_id = ?`,
+        identity.candidateId,
+        identity.draftRev,
+        identity.requirementsRev,
+        identity.sourceRev,
+        expectedRunId,
+      );
+      if (consumed) {
+        return skip('该 Run 的自动返修已消费，不能重复计数');
+      }
+      if (!candidate.filter.matched) {
+        return skip('候选未命中收集规则，不能自动返修');
+      }
+      if (!policy || !Boolean(policy.enabled)) {
+        return skip('自动返修策略未开启');
+      }
+      if (used >= limit) {
+        return skip(`自动返修次数已达上限 ${limit}，需要人工处理`);
+      }
+      if (!hasValidDevelopDecision(candidate)) {
+        return skip('没有与当前任务稿一致的用户开发授权');
+      }
+      if (candidate.state !== 'awaiting_acceptance') {
+        return skip(`候选当前状态为 ${candidate.state}，没有待返修的交付`);
+      }
+      if (candidate.activeRunId) {
+        return skip(`候选仍有活动 Run ${candidate.activeRunId}`);
+      }
+      const running = this.#store.get(
+        "SELECT id FROM runs WHERE candidate_id = ? AND status = 'running' LIMIT 1",
+        candidate.id,
+      );
+      if (running) {
+        return skip(`候选仍有执行中的 Run ${running.id}`);
+      }
+      const latest = this.#currentRunRow(candidate.id);
+      if (!latest) {
+        return skip('候选没有可返修的当前交付');
+      }
+      if (latest.id !== expectedRunId) {
+        return skip('expectedRunId 不是候选最新 Run，拒绝旧交付返修');
+      }
+      if (latest.status !== 'awaiting_acceptance') {
+        return skip(`当前 Run 状态为 ${latest.status}，不能自动返修`);
+      }
+      const reviewReasons = this.#autoRepairReviewReasons(candidate, latest, expectedHeadSha);
+      if (reviewReasons.length > 0) {
+        return skip(reviewReasons.join('；'));
+      }
+
+      const at = now();
+      const inserted = this.#store.run(
+        `INSERT INTO auto_repair_consumptions
+           (candidate_id, draft_rev, requirements_rev, source_rev, from_run_id, head_sha, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(candidate_id, draft_rev, requirements_rev, source_rev, from_run_id)
+         DO NOTHING`,
+        identity.candidateId,
+        identity.draftRev,
+        identity.requirementsRev,
+        identity.sourceRev,
+        expectedRunId,
+        expectedHeadSha,
+        at,
+      );
+      if (inserted.changes === 0) {
+        return skip('该 Run 的自动返修已消费，不能重复计数');
+      }
+
+      const usedAfter = used + 1;
+      this.#store.run(
+        `UPDATE auto_repair_policies
+            SET pending_run_id = ?, pending_head_sha = ?, pending_at = ?, updated_at = ?
+          WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+        expectedRunId,
+        expectedHeadSha,
+        at,
+        at,
+        identity.candidateId,
+        identity.draftRev,
+        identity.requirementsRev,
+        identity.sourceRev,
+      );
+      this.#store.run(
+        "UPDATE candidates SET state = 'ready', updated_at = ? WHERE id = ?",
+        at,
+        candidate.id,
+      );
+      this.#store.appendEvent({
+        at,
+        kind: 'auto_repair.queued',
+        message:
+          `候选 ${candidate.id} 自动返修排队 ${usedAfter}/${limit}，` +
+          `来源 Run ${expectedRunId} head ${expectedHeadSha}`,
+        candidateId: candidate.id,
+        runId: expectedRunId,
+        repo: candidate.issue.repo,
+        data: {
+          ...identity,
+          fromRunId: expectedRunId,
+          headSha: expectedHeadSha,
+          used: usedAfter,
+          limit,
+          remaining: Math.max(0, limit - usedAfter),
+        },
+      });
+      return {
+        queued: true,
+        candidateId: candidate.id,
+        fromRunId: expectedRunId,
+        headSha: expectedHeadSha,
+        used: usedAfter,
+        limit,
+        remaining: Math.max(0, limit - usedAfter),
+        state: 'ready',
+      };
+    });
+  }
+
+  /**
+   * Cancels an unclaimed automatic repair queue. The already reserved budget is
+   * kept (no refund), the candidate returns to `awaiting_acceptance`, and a
+   * readable `auto_repair.cancelled` audit event is written. Manual `ready` /
+   * retry state has no pending marker and is never touched.
+   */
+  cancelAutoRepair(id, input = {}) {
+    if (!isObject(input)) {
+      throw new Error('取消自动返修排队的输入必须是对象');
+    }
+    return this.#store.transaction(() => {
+      const candidate = candidateFromRow(this.#requireCandidateRow(id));
+      const reason =
+        input.reason === undefined
+          ? '自动返修排队已取消'
+          : requireTrimmedString(input.reason, 'reason');
+      const identity = this.#autoRepairIdentity(candidate);
+      const pendingRows = this.#store.all(
+        `SELECT * FROM auto_repair_policies
+          WHERE candidate_id = ? AND pending_run_id IS NOT NULL
+          ORDER BY rowid ASC`,
+        candidate.id,
+      );
+      if (pendingRows.length === 0) {
+        return {
+          cancelled: false,
+          candidateId: candidate.id,
+          reason: '没有待领取的自动返修排队',
+          used: this.#autoRepairUsed(identity),
+        };
+      }
+      for (const row of pendingRows) {
+        this.#cancelAutoRepairPending(candidate, row, reason);
+      }
+      const fresh = candidateFromRow(this.#requireCandidateRow(candidate.id));
+      return {
+        cancelled: true,
+        candidateId: candidate.id,
+        reason,
+        state: fresh.state,
+        used: this.#autoRepairUsed(this.#autoRepairIdentity(fresh)),
+        limit: pendingRows[0].limit_value,
+      };
+    });
+  }
+
   recordAcceptance(id, input) {
     if (!isObject(input)) {
       throw new Error('验收信息必须是对象');
@@ -1300,11 +1692,16 @@ export class Workflow {
       if (!hasValidDevelopDecision(candidate)) {
         throw new Error(`候选 ${id} 的开发授权已失效，不能记录验收`);
       }
-      if (candidate.state !== 'awaiting_acceptance') {
+      const run = this.#currentRunRow(candidate.id);
+      const pending = this.#autoRepairPolicyRow(candidate);
+      const autoQueued =
+        candidate.state === 'ready' &&
+        pending !== null &&
+        run !== null &&
+        pending.pending_run_id === run.id;
+      if (candidate.state !== 'awaiting_acceptance' && !autoQueued) {
         throw new Error(`候选 ${id} 当前状态为 ${candidate.state}，没有待验收结果`);
       }
-
-      const run = this.#currentRunRow(candidate.id);
       if (!run || run.status !== 'awaiting_acceptance') {
         throw new Error(`候选 ${id} 没有待验收的执行结果`);
       }
@@ -1663,6 +2060,360 @@ export class Workflow {
       'SELECT * FROM runs WHERE candidate_id = ? ORDER BY rowid DESC LIMIT 1',
       candidateId,
     );
+  }
+
+  #autoRepairIdentity(candidate) {
+    if (!candidate.draft) {
+      return null;
+    }
+    return {
+      candidateId: candidate.id,
+      draftRev: candidate.draft.rev,
+      requirementsRev: candidate.draft.requirementsRev,
+      sourceRev: candidate.sourceRev,
+    };
+  }
+
+  #autoRepairPolicyRow(candidate) {
+    const identity = this.#autoRepairIdentity(candidate);
+    if (!identity) {
+      return null;
+    }
+    const row = this.#store.get(
+      `SELECT * FROM auto_repair_policies
+        WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+      identity.candidateId,
+      identity.draftRev,
+      identity.requirementsRev,
+      identity.sourceRev,
+    );
+    return row ?? null;
+  }
+
+  #autoRepairUsed(identity) {
+    if (!identity) {
+      return 0;
+    }
+    return this.#store.get(
+      `SELECT COUNT(*) AS count FROM auto_repair_consumptions
+        WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+      identity.candidateId,
+      identity.draftRev,
+      identity.requirementsRev,
+      identity.sourceRev,
+    ).count;
+  }
+
+  #describeAutoRepair(candidate) {
+    const identity = this.#autoRepairIdentity(candidate);
+    const base = {
+      candidateId: candidate.id,
+      enabled: false,
+      limit: AUTO_REPAIR_LIMIT,
+      used: 0,
+      remaining: AUTO_REPAIR_LIMIT,
+      // Whether the current draft still carries the user's develop decision;
+      // Runtime uses this as a local pre-check before any remote read.
+      authorized: hasValidDevelopDecision(candidate),
+      draftRev: identity ? identity.draftRev : null,
+      requirementsRev: identity ? identity.requirementsRev : null,
+      sourceRev: candidate.sourceRev,
+      pendingFromRunId: null,
+      pendingHeadSha: null,
+      pendingAt: null,
+    };
+    if (!identity) {
+      return { ...base, reason: '候选还没有任务稿，自动返修不可用' };
+    }
+    const row = this.#autoRepairPolicyRow(candidate);
+    const used = this.#autoRepairUsed(identity);
+    const limit = row ? row.limit_value : AUTO_REPAIR_LIMIT;
+    const remaining = Math.max(0, limit - used);
+    const enabled = Boolean(row?.enabled);
+    const pendingFromRunId = row?.pending_run_id ?? null;
+    let reason;
+    if (!candidate.filter.matched) {
+      reason = '候选未命中收集规则，自动返修不可用';
+    } else if (!base.authorized) {
+      reason = '没有与当前任务稿一致的用户开发授权，自动返修不可用';
+    } else if (!enabled) {
+      reason = '自动返修未开启';
+    } else if (used >= limit) {
+      reason = `自动返修次数已达上限 ${limit}，需要人工处理`;
+    } else if (pendingFromRunId) {
+      reason = `已自动排队等待领取（来源 Run ${pendingFromRunId}）`;
+    } else {
+      reason = `自动返修已开启，剩余 ${remaining} 次`;
+    }
+    return {
+      ...base,
+      enabled,
+      limit,
+      used,
+      remaining,
+      reason,
+      pendingFromRunId,
+      pendingHeadSha: row?.pending_head_sha ?? null,
+      pendingAt: row?.pending_at ?? null,
+    };
+  }
+
+  #latestAcceptanceForRunHead(runId, headSha) {
+    const rows = this.#store.all(
+      `SELECT * FROM acceptances
+        WHERE run_id = ? AND lower(head_sha) = lower(?)
+        ORDER BY id ASC`,
+      runId,
+      headSha,
+    );
+    const latest = new Map();
+    for (const row of rows) {
+      latest.set(row.role, row);
+    }
+    return latest;
+  }
+
+  #autoRepairReviewReasons(candidate, runRow, headSha) {
+    const reasons = [];
+    if (!candidate.draft) {
+      reasons.push('候选没有当前任务稿');
+    } else {
+      if (runRow.draft_rev !== candidate.draft.rev) {
+        reasons.push('来源 Run 对应旧任务稿版本');
+      }
+      if (runRow.requirements_rev !== candidate.draft.requirementsRev) {
+        reasons.push('来源 Run 对应旧需求版本');
+      }
+    }
+    if (runRow.source_rev !== candidate.sourceRev) {
+      reasons.push('来源 Run 对应旧的 Issue 源内容');
+    }
+    const pinned = candidate.pinnedTemplate;
+    if (!pinned) {
+      reasons.push('任务稿没有固定模板，自动返修不可用');
+    } else if (!candidate.draft || pinned.draftRev !== candidate.draft.rev) {
+      reasons.push('固定模板对应旧任务稿版本');
+    }
+    const result = runRow.result ? JSON.parse(runRow.result) : null;
+    const pr = result?.pr ?? null;
+    if (!pr) {
+      reasons.push('来源 Run 没有 PR，自动返修不可用');
+    } else {
+      if (pr.headSha.toLowerCase() !== headSha.toLowerCase()) {
+        reasons.push('交付 PR head 与预期 head 不一致');
+      }
+      const latest = this.#latestAcceptanceForRunHead(runRow.id, headSha);
+      const hasChanges = [...latest.values()].some(
+        (entry) => entry.verdict === 'changes_requested',
+      );
+      if (!hasChanges) {
+        reasons.push('来源 Run/head 没有最新的 changes_requested 验收');
+      }
+    }
+    return reasons;
+  }
+
+  #clearAutoRepairPendingRow(row, at) {
+    this.#store.run(
+      `UPDATE auto_repair_policies
+          SET pending_run_id = NULL, pending_head_sha = NULL, pending_at = NULL,
+              updated_at = ?
+        WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+      at,
+      row.candidate_id,
+      row.draft_rev,
+      row.requirements_rev,
+      row.source_rev,
+    );
+  }
+
+  #clearAutoRepairPendingForCandidate(candidateId, at) {
+    this.#store.run(
+      `UPDATE auto_repair_policies
+          SET pending_run_id = NULL, pending_head_sha = NULL, pending_at = NULL,
+              updated_at = ?
+        WHERE candidate_id = ? AND pending_run_id IS NOT NULL`,
+      at,
+      candidateId,
+    );
+  }
+
+  /**
+   * Persistently revokes enabled policies for one candidate without touching the
+   * consumption ledger. Source/draft identity changes and defer/ignore decisions
+   * use it so a later identity match cannot revive an old automatic-repair
+   * opt-in; a new opt-in must go through setAutoRepair(enabled:true).
+   */
+  #revokeAutoRepairPolicies(candidate, at, reason, { keepIdentity = null } = {}) {
+    const rows = this.#store.all(
+      `SELECT * FROM auto_repair_policies
+        WHERE candidate_id = ? AND enabled = 1
+        ORDER BY rowid ASC`,
+      candidate.id,
+    );
+    const revoked = [];
+    for (const row of rows) {
+      if (
+        keepIdentity &&
+        row.draft_rev === keepIdentity.draftRev &&
+        row.requirements_rev === keepIdentity.requirementsRev &&
+        row.source_rev === keepIdentity.sourceRev
+      ) {
+        continue;
+      }
+      this.#store.run(
+        `UPDATE auto_repair_policies
+            SET enabled = 0, pending_run_id = NULL, pending_head_sha = NULL,
+                pending_at = NULL, updated_at = ?
+          WHERE candidate_id = ? AND draft_rev = ? AND requirements_rev = ? AND source_rev = ?`,
+        at,
+        row.candidate_id,
+        row.draft_rev,
+        row.requirements_rev,
+        row.source_rev,
+      );
+      revoked.push(row);
+    }
+    if (revoked.length > 0) {
+      this.#store.appendEvent({
+        at,
+        kind: 'auto_repair.revoked',
+        message:
+          `${reason}；撤销 ${revoked.length} 条自动返修开启记录，` +
+          '已消费次数保留，需要重新显式开启',
+        candidateId: candidate.id,
+        repo: candidate.issue.repo,
+        data: {
+          reason,
+          revoked: revoked.map((row) => ({
+            draftRev: row.draft_rev,
+            requirementsRev: row.requirements_rev,
+            sourceRev: row.source_rev,
+            used: this.#autoRepairUsed({
+              candidateId: candidate.id,
+              draftRev: row.draft_rev,
+              requirementsRev: row.requirements_rev,
+              sourceRev: row.source_rev,
+            }),
+          })),
+        },
+      });
+    }
+    return revoked;
+  }
+
+  #cancelAutoRepairPending(candidate, row, reason) {
+    const at = now();
+    const fromRunId = row.pending_run_id;
+    const headSha = row.pending_head_sha;
+    this.#clearAutoRepairPendingRow(row, at);
+    const fresh = candidateFromRow(this.#requireCandidateRow(candidate.id));
+    const latest = this.#currentRunRow(candidate.id);
+    if (fresh.state === 'ready' && latest && latest.status === 'awaiting_acceptance') {
+      this.#store.run(
+        "UPDATE candidates SET state = 'awaiting_acceptance', updated_at = ? WHERE id = ?",
+        at,
+        candidate.id,
+      );
+    }
+    this.#store.appendEvent({
+      at,
+      kind: 'auto_repair.cancelled',
+      message: reason,
+      candidateId: candidate.id,
+      runId: fromRunId,
+      repo: candidate.issue.repo,
+      data: {
+        fromRunId,
+        headSha,
+        used: this.#autoRepairUsed(this.#autoRepairIdentity(fresh)),
+        limit: row.limit_value,
+      },
+    });
+  }
+
+  /**
+   * Re-verifies an unclaimed queued auto repair before claimNext creates a Run.
+   * Returns null when no auto queue exists, 'cancelled' after reverting it to
+   * awaiting_acceptance, or the pending policy row when it is still valid.
+   */
+  #guardAutoRepairClaim(candidateRow, { autoRepairAllowlist = null } = {}) {
+    const candidate = candidateFromRow(candidateRow);
+    const pendingRows = this.#store.all(
+      `SELECT * FROM auto_repair_policies
+        WHERE candidate_id = ? AND pending_run_id IS NOT NULL`,
+      candidate.id,
+    );
+    if (pendingRows.length === 0) {
+      return null;
+    }
+    if (autoRepairAllowlist && !autoRepairAllowlist.has(candidate.id)) {
+      // The caller (Runtime) has not re-verified this queued automatic repair
+      // against the live PR/source yet. Keep it queued instead of claiming it
+      // without the external checks; other candidates keep being considered.
+      return 'deferred';
+    }
+    const identity = this.#autoRepairIdentity(candidate);
+    const current = pendingRows.find(
+      (row) =>
+        identity &&
+        row.draft_rev === identity.draftRev &&
+        row.requirements_rev === identity.requirementsRev &&
+        row.source_rev === identity.sourceRev,
+    );
+    const at = now();
+    for (const row of pendingRows) {
+      if (row !== current) {
+        this.#clearAutoRepairPendingRow(row, at);
+      }
+    }
+    if (!current) {
+      return 'cancelled';
+    }
+
+    const reasons = [];
+    if (!Boolean(current.enabled)) {
+      reasons.push('自动返修策略已关闭');
+    }
+    if (!candidate.filter.matched) {
+      reasons.push('候选未命中收集规则');
+    }
+    if (!hasValidDevelopDecision(candidate)) {
+      reasons.push('开发授权已失效或不属于当前任务稿');
+    }
+    if (candidate.activeRunId) {
+      reasons.push(`候选仍有活动 Run ${candidate.activeRunId}`);
+    }
+    const running = this.#store.get(
+      "SELECT id FROM runs WHERE candidate_id = ? AND status = 'running' LIMIT 1",
+      candidate.id,
+    );
+    if (running) {
+      reasons.push(`候选仍有执行中的 Run ${running.id}`);
+    }
+    const latest = this.#currentRunRow(candidate.id);
+    if (!latest) {
+      reasons.push('没有可返修的当前交付');
+    } else {
+      if (latest.id !== current.pending_run_id) {
+        reasons.push('自动排队对应的 Run 已不是最新交付');
+      }
+      if (latest.status !== 'awaiting_acceptance') {
+        reasons.push(`当前 Run 状态为 ${latest.status}`);
+      }
+      reasons.push(
+        ...this.#autoRepairReviewReasons(candidate, latest, current.pending_head_sha),
+      );
+    }
+    if (reasons.length === 0) {
+      return current;
+    }
+    this.#cancelAutoRepairPending(
+      candidate,
+      current,
+      `自动排队已失效：${reasons.join('；')}`,
+    );
+    return 'cancelled';
   }
 
   #staleRunReason(run, candidate) {

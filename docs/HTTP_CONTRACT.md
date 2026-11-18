@@ -41,11 +41,20 @@ Candidate DTO：
   eligibility: { eligible: false, reasons: ['尚未确认开发'] },
   reviews: { user: null, design: null },
   latestResult: null, mergePending: false,
+  autoRepair: {
+    candidateId: 'owner/repo#123', enabled: false, authorized: true,
+    limit: 2, used: 0, remaining: 2, reason: '自动返修未开启',
+    draftRev: '<opaque>', requirementsRev: 'sha256:...', sourceRev: '...',
+    pendingFromRunId: null, pendingHeadSha: null, pendingAt: null,
+    blockedReason: null, blockedAt: null, nextAttemptAt: null
+  },
   createdAt, updatedAt
 }
 ```
 
 draft 可为 null。review 非空时包含 `{verdict,headSha,comment,at}`。latestResult 为 `{summary,artifacts,evidence,pr}`，pr 可空或 `{repo,number,url,headSha}`。
+
+autoRepair 只读展示服务端持久策略：`enabled` 是显式开关，`authorized` 表示当前稿是否仍有有效用户开发授权，`limit/used/remaining` 是服务端记账（上限 2，关闭或撤销不回退），`reason` 说明当前可/不可自动返修的原因，`pendingFromRunId/pendingHeadSha/pendingAt` 是已入队待领取绑定。`blockedReason/blockedAt/nextAttemptAt` 是 Runtime 当轮观测到的暂停原因、时间与有限退避的重试时间，可为 null。客户端不能写入这些字段。
 
 Run DTO 至少包含 `{id,candidateId,repo,issueRef,draftRev,requirementsRev,status,phase,templateRef,branch,worktreePath,result,blockedReason,createdAt,updatedAt}`。状态 running/blocked/awaiting_acceptance/completed；phase 表示准备、执行、检查、提交 PR 等当前阶段。
 
@@ -68,11 +77,14 @@ Event 为 `{id,at,kind,message,candidateId,runId,repo,data}`。只展示必要�
 | `PUT /api/candidates/:id/draft` | 完整 Draft 输入字段及当前 `rev`（首次 null），CAS 冲突返回 409，成功返回新 Candidate |
 | `POST /api/candidates/:id/decision` | `{action:'develop'|'defer'|'ignore',draftRev}`；actor 由服务端固定为 user。无稿时可暂缓/忽略并省略 draftRev；develop 严格匹配当前稿 |
 | `POST /api/candidates/:id/retry` | `{}`，仅在当前开发授权仍有效且原执行已终止时重新入队 |
+| `PUT /api/candidates/:id/auto-repair` | `{enabled:boolean,draftRev?}`；开启时 `draftRev` 必须是当前任务稿版本，服务端会先只读刷新 Issue 来源并校验当前开发授权，来源变化/授权失效 409；关闭不需要 `draftRev` 且总能停止。只接受 `enabled`，忽略客户端传入的 actor/limit/used 等预算或身份字段。返回 `{candidateId,autoRepair}` |
 | `POST /api/runs/:id/cancel` | `{}`，请求并确认进程停止后记入阻塞，保留工作目录 |
 | `POST /api/candidates/:id/acceptance` | `{role:'user'|'design',verdict:'approved'|'changes_requested',headSha,comment}`，记录对应角色对指定提交的验收；设计验收 comment 需给出监督结论或引用 |
 | `POST /api/candidates/:id/merge` | `{expectedHeadSha,confirmed:true,method:'merge'|'squash'|'rebase'}`；核对两种验收与 GitHub 当前 head 后才执行。实际 MERGED + 完整 SHA 返回 `{merged:true,mergeSha}`；未确认结果返回 `{merged:false,pending:true,note}`，后台只读核对，不重复发送。state 中 Candidate.mergePending=true |
 
 develop 成功后由监督循环自动领取，不要求用户再次点击派发。需求版本变化清除旧授权；有待决策项或空验收的任务稿不能批准。合并始终是独立的用户操作，不因检查通过、两种验收存在或后台循环运行而自动发生。
+
+自动返修由用户在候选上显式开启，最多两次且只消费已明确记录的 `changes_requested`；每次领取前 Runtime 会重新核验远端 PR/Issue 与本地 merge intent/unknown 状态，失败或漂移只会暂停/取消本次排队并保留已用次数，不会绕过核验派发，也不影响其他手动任务。返修不扩展 writeScopes、不改任务稿或模板，且永不自动批准或合并。
 
 ## 多仓库与调度
 

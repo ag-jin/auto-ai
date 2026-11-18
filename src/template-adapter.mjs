@@ -14,9 +14,35 @@ const ROLES = new Set(['worker', 'draft']);
 // a feature toggle.
 const RESERVED_ROLES = new Map([['requirements', 'draft']]);
 const MAX_BUFFER = 16 * 1024 * 1024;
+// A catalog entry that declares something invalid is an entry-level mistake:
+// tolerant callers may isolate it. A blob that Git cannot read is a source
+// fault and must never be turned into "this entry is absent".
+const ENTRY_INVALID = 'template_entry_invalid';
+const BLOB_UNREADABLE = 'template_blob_unreadable';
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function entryConfigError(message) {
+  const error = new Error(message);
+  error.code = ENTRY_INVALID;
+  return error;
+}
+
+function asEntryConfigError(error) {
+  if (error?.code === ENTRY_INVALID || error?.code === BLOB_UNREADABLE) {
+    return error;
+  }
+  return entryConfigError(String(error?.message ?? error));
+}
+
+function errorDetail(error) {
+  return String(error?.stderr || error?.message || '')
+    .trim()
+    .split('\n')
+    .slice(0, 4)
+    .join('\n');
 }
 
 /**
@@ -237,12 +263,38 @@ async function readBlob({ repoDir, commit, blobPath, run, label }) {
     });
     return result.stdout;
   } catch (error) {
-    const detail = String(error?.stderr || error?.message || '')
-      .trim()
+    const readError = new Error(
+      `${label} 在提交 ${commit} 中读取失败（路径不存在或对象不可读）：${errorDetail(error) || '未知错误'}`,
+    );
+    readError.code = BLOB_UNREADABLE;
+    readError.blobPath = blobPath;
+    throw readError;
+  }
+}
+
+/**
+ * `git cat-file` cannot tell "the catalog points at a path that never existed"
+ * from "Git cannot read an object it still lists". Only the fixed commit tree
+ * can, so a failed read is followed by exactly one `ls-tree` probe: absence is
+ * an entry-level mistake, a listed path or a failing probe is a source fault.
+ */
+async function templatePathInTree({ repoDir, commit, blobPath, run, label }) {
+  try {
+    const result = await run(
+      'git',
+      ['-C', repoDir, 'ls-tree', '--name-only', commit, '--', blobPath],
+      { maxBuffer: MAX_BUFFER },
+    );
+    return result.stdout
       .split('\n')
-      .slice(0, 4)
-      .join('\n');
-    throw new Error(`${label} 在提交 ${commit} 中不存在或无法读取：${detail || '未知错误'}`);
+      .map((line) => line.trim())
+      .includes(blobPath);
+  } catch (error) {
+    const treeError = new Error(
+      `${label} 在提交 ${commit} 中读取失败，且 git ls-tree 无法确认该路径是否存在：${errorDetail(error) || '未知错误'}`,
+    );
+    treeError.code = BLOB_UNREADABLE;
+    throw treeError;
   }
 }
 
@@ -265,12 +317,17 @@ async function loadTemplate({ repoDir, commit, id, templatePath, run }) {
     run,
     label: `模板 ${templatePath}`,
   });
-  const meta = splitFrontMatter(text, `模板 ${templatePath}`);
-  const validated = requireTemplateMeta(meta, {
-    id,
-    templatePath,
-    label: `模板 ${templatePath}`,
-  });
+  let validated;
+  try {
+    const meta = splitFrontMatter(text, `模板 ${templatePath}`);
+    validated = requireTemplateMeta(meta, {
+      id,
+      templatePath,
+      label: `模板 ${templatePath}`,
+    });
+  } catch (error) {
+    throw asEntryConfigError(error);
+  }
   return { text, version: validated.version, role: validated.role };
 }
 
@@ -280,14 +337,20 @@ async function loadTemplate({ repoDir, commit, id, templatePath, run }) {
  * must agree with the template frontmatter.
  */
 async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRole }) {
-  const templatePath = catalogDefaultToRepoPath(
-    entry.default,
-    `模板 ${id} 的 catalog default`,
-  );
-  const catalogRole =
-    entry.role === undefined
-      ? null
-      : normalizeRole(entry.role, `模板 ${id} 的 catalog`);
+  let templatePath;
+  let catalogRole;
+  try {
+    templatePath = catalogDefaultToRepoPath(
+      entry.default,
+      `模板 ${id} 的 catalog default`,
+    );
+    catalogRole =
+      entry.role === undefined
+        ? null
+        : normalizeRole(entry.role, `模板 ${id} 的 catalog`);
+  } catch (error) {
+    throw asEntryConfigError(error);
+  }
   const template = await loadTemplate({
     repoDir,
     commit,
@@ -296,18 +359,20 @@ async function resolveCatalogEntry({ repoDir, commit, id, entry, run, expectedRo
     run,
   });
   if (catalogRole !== null && catalogRole !== template.role) {
-    throw new Error(
+    throw entryConfigError(
       `模板 ${id} 的 catalog role ${catalogRole} 与模板 role ${template.role} 不一致`,
     );
   }
   const reservedRole = RESERVED_ROLES.get(id);
   if (reservedRole !== undefined && template.role !== reservedRole) {
-    throw new Error(
+    throw entryConfigError(
       `模板 ${id} 的 role 为 ${template.role}，保留 ID 的 role 必须为 ${reservedRole}`,
     );
   }
   if (expectedRole !== null && template.role !== expectedRole) {
-    throw new Error(`模板 ${id} 的 role 为 ${template.role}，不能作为 ${expectedRole} 模板`);
+    throw entryConfigError(
+      `模板 ${id} 的 role 为 ${template.role}，不能作为 ${expectedRole} 模板`,
+    );
   }
   return { ...template, path: templatePath };
 }
@@ -360,8 +425,11 @@ export async function resolveTemplate({ repoDir, ref = 'HEAD', id, run, expected
  * (bad default path, missing file, invalid or conflicting role, invalid
  * metadata) fails the whole call, exactly like `resolveTemplate`. Callers that
  * render an overview may pass `skipInvalidEntries: true` to isolate such an
- * entry and keep the remaining valid ones. A repository whose catalog itself
- * cannot be read still fails the whole call in both modes.
+ * entry and keep the remaining valid ones. Only explicit entry-level mistakes
+ * are isolated (bad path or metadata, conflicting role, or a path the fixed
+ * commit tree proves absent). A repository whose catalog itself cannot be read,
+ * or a blob Git cannot read even though the tree still lists it, fails the
+ * whole call in both modes: a half-read list is never reported as success.
  */
 export async function listTemplates({
   repoDir,
@@ -385,10 +453,10 @@ export async function listTemplates({
     try {
       templateId = requireId(id);
       if (!isObject(entry)) {
-        throw new Error(`模板 catalog 中 ${templateId} 的条目不是对象`);
+        throw entryConfigError(`模板 catalog 中 ${templateId} 的条目不是对象`);
       }
       if (entry.description !== undefined && typeof entry.description !== 'string') {
-        throw new Error(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
+        throw entryConfigError(`模板 catalog 中 ${templateId} 的 description 必须是字符串`);
       }
       template = await resolveCatalogEntry({
         repoDir: normalizedRepoDir,
@@ -401,6 +469,28 @@ export async function listTemplates({
     } catch (error) {
       if (!skipInvalidEntries) {
         // Strict default: an invalid entry is reported, not silently dropped.
+        throw error;
+      }
+      if (error?.code === BLOB_UNREADABLE) {
+        const inTree = await templatePathInTree({
+          repoDir: normalizedRepoDir,
+          commit,
+          blobPath: error.blobPath,
+          run: runner,
+          label: `模板 ${error.blobPath}`,
+        });
+        if (inTree) {
+          // The tree lists the path, so this is a Git read fault, not an
+          // absent entry: keep the original reason and fail the whole list.
+          throw new Error(
+            `${error.message}；git ls-tree 证实该路径存在于提交 ${commit} 的树中，属于读取失败而非缺失条目`,
+          );
+        }
+        // The fixed commit tree proves the path is absent: entry-level mistake.
+        continue;
+      }
+      if (error?.code !== ENTRY_INVALID) {
+        // Unknown failures are not entry-level mistakes and must not be hidden.
         throw error;
       }
       // Opt-in per-entry isolation: one invalid template never clears the others.

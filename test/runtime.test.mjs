@@ -771,6 +771,93 @@ test('开发入口拒绝 draft 模板，只接受 worker 执行模板', async (t
   await runtime.close();
 });
 
+test('catalog YAML 非法时状态仍可读，模板列表显式失败而不是伪装成空列表', async (t) => {
+  const appRepo = await tempDir(t, 't007-bad-catalog-');
+  await writeTemplateRepo(appRepo, { includeRequirements: false });
+  await writeFile(
+    path.join(appRepo, 'templates', 'catalog.yml'),
+    'schema_version: 1\ntemplates: {}\n',
+    'utf8',
+  );
+  await commitTemplateRepo(appRepo, 'valid empty catalog');
+  const { runtime, github } = await makeRuntime(t, { appRepoDir: appRepo });
+  try {
+    await configure(runtime);
+    await runtime.start();
+
+    // A valid empty catalog is a normal empty list, not a failure.
+    const empty = await runtime.getState();
+    assert.deepEqual(empty.templates, []);
+    assert.equal(empty.templateListError ?? null, null);
+
+    await writeFile(
+      path.join(appRepo, 'templates', 'catalog.yml'),
+      'schema_version: 1\ntemplates: [\n',
+      'utf8',
+    );
+    await commitTemplateRepo(appRepo, 'catalog YAML syntax error');
+
+    github.setIssues(REPO, [issue(1)]);
+    await runtime.collect();
+    const broken = await runtime.getState();
+    assert.deepEqual(broken.templates, []);
+    assert.match(broken.templateListError ?? '', /catalog/i);
+    assert.match(broken.templateListError ?? '', /YAML/i);
+    // Everything else in the workbench state stays readable.
+    assert.deepEqual(broken.settings, empty.settings);
+    assert.equal(broken.candidates.length, 1);
+    assert.equal(broken.runs.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('Git 对象不可读属于模板源故障：列表整体为空并保留路径与原因', async (t) => {
+  const appRepo = await tempDir(t, 't007-missing-object-');
+  await writeTemplateRepo(appRepo);
+  await mkdir(path.join(appRepo, 'templates', 'research'), { recursive: true });
+  const blobPath = 'templates/research/1.0.0.md';
+  await writeFile(
+    path.join(appRepo, blobPath),
+    '---\nschema_version: 1\nid: research\nversion: "1.0.0"\n---\n\n# 调研\n',
+    'utf8',
+  );
+  await writeFile(
+    path.join(appRepo, 'templates', 'catalog.yml'),
+    `${requirementsCatalog('1.0.0')}  research:\n    description: 调研\n    default: research/1.0.0.md\n`,
+    'utf8',
+  );
+  const commit = await commitTemplateRepo(appRepo, 'two worker templates');
+  const { runtime } = await makeRuntime(t, { appRepoDir: appRepo });
+  try {
+    await configure(runtime);
+    await runtime.start();
+    const healthy = await runtime.getState();
+    assert.deepEqual(
+      healthy.templates.map((item) => `${item.id}:${item.role}`),
+      ['development:worker', 'research:worker'],
+    );
+    assert.equal(healthy.templateListError ?? null, null);
+
+    // Real Git fault: the committed tree still lists the path, but the loose
+    // object is gone, so the blob cannot be read.
+    const objectHash = await gitOut(appRepo, ['rev-parse', `${commit}:${blobPath}`]);
+    await rm(
+      path.join(appRepo, '.git', 'objects', objectHash.slice(0, 2), objectHash.slice(2)),
+    );
+    const tree = await gitOut(appRepo, ['ls-tree', commit, '--', blobPath]);
+    assert.ok(tree.includes(objectHash), '路径仍存在于已提交的树中');
+
+    const broken = await runtime.getState();
+    assert.deepEqual(broken.templates, [], '不完整的读取不能当作一次成功枚举');
+    assert.match(broken.templateListError ?? '', /templates\/research\/1\.0\.0\.md/);
+    assert.match(broken.templateListError ?? '', /读取失败|Git/);
+    assert.deepEqual(broken.settings, healthy.settings);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('requirements 声明为 worker 或损坏时不隐藏开发模板，也不被当作开发模板', async (t) => {
   // One unrelated broken worker entry plus the relabelled reserved ID. Catalog
   // and frontmatter agree on `worker` for requirements, which is still invalid

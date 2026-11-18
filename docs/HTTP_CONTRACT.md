@@ -13,7 +13,7 @@
     rules: { repositories: [], labels: [], authors: [], keywords: [], states: ['open'] },
     concurrency: { global: 2, perRepo: 2 }
   },
-  candidates: [], runs: [], events: [], templates: [],
+  candidates: [], runs: [], events: [], templates: [], templateListError: null,
   runtime: { watching: false, intervalSeconds: 60, lastPollAt: null, activeDrafts: [] },
   capabilities: { githubReady: false, piReady: false },
   csrfToken: '<local-session-token>'
@@ -21,6 +21,8 @@
 ```
 
 `templates` 只包含可执行的 worker 模板，每项为 `{id,version,role:'worker',description,path,templateRef,commit}`。draft 角色的 requirements 整理模板不提供给前端选择，develop 入口也会拒绝 draft 模板。
+
+`templateListError` 为 null 表示模板列表已完整枚举，包括正常的空列表；固定 commit 的 catalog 无法解析（错误信息含 catalog/YAML）或模板对象读取失败（信息含模板相对路径与读取原因）时为原因字符串，此时 `templates` 为 `[]` 且其余状态字段照常可读。只有明确的条目级配置错误（非法路径、非法元数据或角色、固定 commit 树中确认不存在的路径）会被单独跳过，不设置 `templateListError`；Git 读取失败或未知异常不被当作条目错误。
 
 Candidate DTO：
 

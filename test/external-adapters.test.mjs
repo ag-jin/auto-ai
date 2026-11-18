@@ -1411,7 +1411,7 @@ templates:
   );
   await assert.rejects(
     () => resolveTemplate({ repoDir: repo.repo, id: 'broken' }),
-    /broken\/1\.0\.0\.md 在提交 .* 中不存在或无法读取/,
+    /broken\/1\.0\.0\.md 在提交 .* 中读取失败/,
   );
 
   // Compatibility: the generic list stays strict, so existing callers and the
@@ -1443,5 +1443,56 @@ templates:
   assert.deepEqual(
     isolatedAll.map((item) => `${item.id}:${item.role}`),
     ['development:worker', 'research:worker'],
+  );
+});
+
+test('容错枚举只吸收条目级配置错误，catalog 与对象读取故障整体失败', async (t) => {
+  // An unparseable catalog is a source fault: no mode may report it as an empty
+  // or partial template list.
+  const badCatalog = await makeTemplateRepo(t, {
+    catalog: 'schema_version: 1\ntemplates: [\n',
+  });
+  for (const skipInvalidEntries of [false, true]) {
+    await assert.rejects(
+      () => listTemplates({ repoDir: badCatalog.repo, ref: 'HEAD', skipInvalidEntries }),
+      /catalog.*YAML|YAML.*catalog/i,
+    );
+  }
+
+  // A path the fixed commit tree proves absent stays an isolated entry.
+  const absent = await makeTemplateRepo(t, {
+    catalog: `${VALID_CATALOG}  absent:\n    description: 未提交\n    default: absent/1.0.0.md\n`,
+  });
+  const isolated = await listTemplates({
+    repoDir: absent.repo,
+    ref: 'HEAD',
+    skipInvalidEntries: true,
+  });
+  assert.deepEqual(
+    isolated.map((item) => item.id),
+    ['development', 'research'],
+  );
+
+  // Git cannot read an object the tree still lists. That is a read fault, not
+  // an absent template path, so even the tolerant list fails as a whole instead
+  // of returning the entries that happened to read first.
+  const unreadable = await makeTemplateRepo(t);
+  const blobPath = 'templates/research/1.0.0.md';
+  const objectHash = await gitOut(unreadable.repo, [
+    'rev-parse',
+    `${unreadable.commit}:${blobPath}`,
+  ]);
+  assert.deepEqual(
+    (await listTemplates({ repoDir: unreadable.repo, ref: 'HEAD' })).map((item) => item.id),
+    ['development', 'research'],
+  );
+  await rm(
+    path.join(unreadable.repo, '.git', 'objects', objectHash.slice(0, 2), objectHash.slice(2)),
+  );
+  const tree = await gitOut(unreadable.repo, ['ls-tree', unreadable.commit, '--', blobPath]);
+  assert.ok(tree.includes(objectHash), '路径仍存在于已提交的树中');
+  await assert.rejects(
+    () => listTemplates({ repoDir: unreadable.repo, ref: 'HEAD', skipInvalidEntries: true }),
+    /templates\/research\/1\.0\.0\.md 在提交 .* 中读取失败/,
   );
 });

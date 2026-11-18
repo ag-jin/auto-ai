@@ -493,12 +493,16 @@ export class Runtime {
       };
     });
     const events = workflow.listEvents({ limit: 300, order: 'desc' }).reverse();
+    const templateList = await this.#templateList();
     return {
       settings,
       candidates,
       runs,
       events,
-      templates: await this.#templateList(),
+      templates: templateList.templates,
+      // Explicit source failure: an unavailable template list is declared, so
+      // an empty `templates` array never hides a broken catalog or Git fault.
+      templateListError: templateList.templateListError,
       runtime: this.#runtimeDto(this.#activeDraftIds()),
       capabilities: await this.#capabilities(),
     };
@@ -554,7 +558,7 @@ export class Runtime {
     try {
       // The workbench only offers worker execution templates for development;
       // the draft-role requirements method is resolved by Runtime itself.
-      return await listTemplates({
+      const templates = await listTemplates({
         repoDir: this.#appRepoDir,
         ref: 'HEAD',
         role: 'worker',
@@ -562,8 +566,12 @@ export class Runtime {
         // the development template list. Every other caller stays strict.
         skipInvalidEntries: true,
       });
-    } catch {
-      return [];
+      return { templates, templateListError: null };
+    } catch (error) {
+      return {
+        templates: [],
+        templateListError: `开发模板列表不可用：${errorMessage(error)}`,
+      };
     }
   }
 

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>auto-ai · 多仓库需求与执行工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <path d="M5 9.5 16 4l11 5.5v13L16 28 5 22.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+        <path d="M11 12.5v7M16 10.5v11M21 13.5v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <div class="brand-text">
+        <span class="brand-name">auto-ai</span>
+        <span class="brand-sub">多仓库需求与执行工作台</span>
+      </div>
+    </div>
+    <p class="scope-line" id="scope-line" aria-live="polite">正在连接本地工作台…</p>
+    <div class="top-controls" id="top-controls"></div>
+  </header>
+
+  <div class="banner-region" id="banner-region" aria-live="polite"></div>
+
+  <div class="shell">
+    <aside class="sidebar" id="sidebar" aria-label="视图与仓库筛选">
+      <p class="sidebar-hint">正在加载视图…</p>
+    </aside>
+    <main class="main" id="main" tabindex="-1">
+      <h1 class="visually-hidden">auto-ai 多仓库需求与执行工作台</h1>
+      <div class="loading-state" role="status">正在读取工作台状态…</div>
+    </main>
+  </div>
+
+  <noscript>
+    <p class="noscript">此工作台需要 JavaScript 才能读取本地服务状态并执行操作。</p>
+  </noscript>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

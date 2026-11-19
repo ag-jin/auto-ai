@@ -1,0 +1,21 @@
+{
+  "name": "auto-ai-github-first",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Template-driven local GitHub and Pi execution workbench",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "test": "node --test",
+    "check:trial": "node scripts/check-t001.mjs",
+    "check:workflow": "node scripts/check-workflow.mjs",
+    "check:runtime": "node scripts/check-runtime.mjs",
+    "check:runtime:live": "node scripts/check-runtime.mjs --live-pi"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}

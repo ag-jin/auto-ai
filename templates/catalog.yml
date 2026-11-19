@@ -1,0 +1,15 @@
+schema_version: 1
+templates:
+  development:
+    description: 开发与修复，交付改动和验证证据。
+    default: development/1.2.0.md
+  development-sop:
+    description: 版本化双路 SOP：批准稿固定、两路并行、定向返工与独立复核，一个 Run 交付一个 PR。
+    default: development-sop/1.0.0.md
+  research:
+    description: 调研与设计探索，交付有来源的结论。
+    default: research/1.0.0.md
+  requirements:
+    description: 只读需求整理，固定 draft 角色并输出严格 JSON 任务稿。
+    role: draft
+    default: requirements/1.0.0.md

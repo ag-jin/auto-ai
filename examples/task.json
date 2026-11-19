@@ -1,0 +1,11 @@
+{
+  "issue_ref": "ag-jin/auto-ai#123",
+  "run_id": "T001-example",
+  "attempt": 1,
+  "inputs": {
+    "goal": "修复订单重复提交",
+    "acceptance": ["快速连点只产生一笔订单"],
+    "scope": "订单提交逻辑",
+    "context": ""
+  }
+}

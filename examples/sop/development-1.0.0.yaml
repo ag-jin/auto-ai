@@ -1,0 +1,19 @@
+sop: development@1.0.0
+lanes:
+  develop-a:
+    artifact: subtotal.mjs
+    handoff: develop-a.yaml
+  develop-b:
+    artifact: fee.mjs
+    handoff: develop-b.yaml
+integrate:
+  check: node examples/sop/check.mjs
+  on_failure: 退回缺失或失败的一路
+review:
+  after: integrate
+  independent: true
+  on_failure: integrate
+pull_request:
+  after: review
+  count: 1
+  on_failure: review

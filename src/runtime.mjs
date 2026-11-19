@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   accessSync,
@@ -9,7 +10,11 @@ import {
 } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
+import {
+  advanceDevelopmentSop, archiveDevelopmentSop, cancelDevelopmentSop, parseSopPlan, parseSopTask,
+} from './development-sop.mjs';
 import { GitHubAdapter } from './github-adapter.mjs';
 import { PiAdapter } from './pi-adapter.mjs';
 import { prepareTask } from './prepare-task.mjs';
@@ -49,9 +54,18 @@ const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
 // The requirements method is versioned Git content, never a hard-coded prompt.
 const REQUIREMENTS_TEMPLATE_ID = 'requirements';
+// One explicit template id selects the versioned two-lane SOP route.
+const SOP_TEMPLATE_ID = 'development-sop';
+const execFileAsync = promisify(execFile);
 
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// A Run's template route is frozen in its own snapshot; a cleared candidate pin
+// must never make an in-flight SOP Run fall back to the single Worker path.
+function isSopRun(run) {
+  return run?.draftSnapshot?.templateId === SOP_TEMPLATE_ID;
 }
 
 function now() {
@@ -247,6 +261,8 @@ export class Runtime {
   #drafts = new Map();
   #draftMutation = Promise.resolve();
   #mergeQueues = new Map();
+  // SOP Run ids whose cancel helper is confirming a stop; tick must not advance them.
+  #cancelling = new Set();
 
   constructor({ dataDir, appRepoDir, github, workspace, pi, tickMs = 1000 } = {}) {
     this.#dataDir = requireAbsolutePath(dataDir, 'dataDir');
@@ -991,6 +1007,7 @@ export class Runtime {
     }
 
     let template = null;
+    let sopRef = null;
     if (action === 'develop') {
       try {
         template = await resolveTemplate({
@@ -1012,6 +1029,19 @@ export class Runtime {
           `模板 ${template.id} 的 role 为 ${template.role}，不能用于开发`,
         );
       }
+      if (template.id === SOP_TEMPLATE_ID) {
+        try {
+          parseSopTask(candidate.draft);
+        } catch (error) {
+          throw httpError(400, 'sop_context_invalid', `任务稿 context 不可执行：${errorMessage(error)}`);
+        }
+        sopRef = `${template.commit}:templates/${template.id}/${template.version}.yaml`;
+        try {
+          await this.#loadSopPlan(sopRef, template.version);
+        } catch (error) {
+          throw httpError(503, 'template_unavailable', `SOP 计划不可用：${errorMessage(error)}`);
+        }
+      }
     }
 
     try {
@@ -1026,6 +1056,7 @@ export class Runtime {
               id: template.id,
               version: template.version,
               templateRef: template.templateRef,
+              ...(sopRef === null ? {} : { sopRef }),
             }
           : undefined,
       });
@@ -1067,6 +1098,9 @@ export class Runtime {
     const run = workflow.getRun(runId);
     if (run.status !== 'running') {
       return { runId: run.id, state: run.status, stopped: false };
+    }
+    if (isSopRun(run)) {
+      return this.#cancelSopRun(run);
     }
 
     let status;
@@ -1116,6 +1150,63 @@ export class Runtime {
       repo: run.repo,
     });
     return { runId: run.id, state, stopped: false };
+  }
+
+  /** SOP cancel: wait for the in-flight tick, then mark the run so no tick advances it. */
+  async #cancelSopRun(run) {
+    const workflow = this.#wf;
+    await this.#tickPromise?.catch(() => undefined);
+    const current = workflow.getRun(run.id);
+    if (current.status !== 'running') {
+      return { runId: run.id, state: current.status, stopped: false };
+    }
+    if (this.#cancelling.has(run.id)) {
+      return { runId: run.id, state: 'cancelling', stopped: false };
+    }
+    this.#cancelling.add(run.id);
+    try {
+      const control = this.#readControlSync(run.id) ?? { schemaVersion: 1, runId: run.id };
+      const persist = (next) => this.#writeControl(run.id, next);
+      const outcome = await cancelDevelopmentSop({ run, control, pi: this.#pi, persist }).catch(
+        (error) => ({ state: 'unknown', reason: errorMessage(error) }),
+      );
+      const state = outcome?.state ?? 'unknown';
+      if (state === 'completed') {
+        // The core already passed and only waits for delivery. Deliver the saved
+        // result directly: the cancel marker and core's cancelRequested must not
+        // block it, and no lane may start.
+        if (isObject(control?.sop?.result)) {
+          await this.#deliver(run, control, null, control.sop.result);
+          return { runId: run.id, state, stopped: true };
+        }
+        workflow.recordEvent({
+          kind: 'run.cancel_unknown',
+          message: 'SOP 已完成但缺少已保存结果，保持运行占用待人工核对',
+          candidateId: run.candidateId,
+          runId: run.id,
+          repo: run.repo,
+        });
+        return { runId: run.id, state: 'unknown', stopped: false };
+      }
+      if (state !== 'cancelled') {
+        workflow.recordEvent({
+          kind: 'run.cancel_unknown',
+          message: `SOP 取消未确认（${state}）：${outcome?.reason ?? '保持运行占用'}`,
+          candidateId: run.candidateId,
+          runId: run.id,
+          repo: run.repo,
+        });
+        return { runId: run.id, state, stopped: false };
+      }
+      try {
+        workflow.blockRun(run.id, '用户取消执行（SOP 子任务已确认停止），保留工作树现场');
+      } catch (error) {
+        throw this.#domainError(error);
+      }
+      return { runId: run.id, state, stopped: true };
+    } finally {
+      this.#cancelling.delete(run.id);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1519,6 +1610,7 @@ export class Runtime {
   }
 
   async #safeAdvance(run) {
+    if (this.#cancelling.has(run.id)) return;
     try {
       await this.#advanceRun(run);
     } catch (error) {
@@ -2009,6 +2101,12 @@ export class Runtime {
       control = prepared;
     }
 
+    if (isSopRun(run)) {
+      // SOP route: the frozen plan drives the run; no single Worker Pi starts.
+      await this.#advanceSop(run, candidate, repoEntry, control);
+      return;
+    }
+
     if (!control.spawn || control.spawn.status === 'starting') {
       const spawned = await this.#spawnRun(run, control);
       if (!spawned) {
@@ -2024,9 +2122,97 @@ export class Runtime {
     await this.#pollRun(current, control);
   }
 
+  /** True while any lane or review Pi the core started is not confirmed terminal. */
+  #sopTasksUnconfirmed(control) {
+    const active = new Set(['starting', 'running', 'unknown']);
+    const review = control?.sop?.review;
+    if (review?.piId && active.has(review.piStatus)) return true;
+    return Object.values(control?.sop?.lanes ?? {}).some(
+      (lane) => lane?.piId && active.has(lane.piStatus),
+    );
+  }
+
+  async #loadSopPlan(ref, version) {
+    const { stdout } = await execFileAsync('git', [
+      '-C', this.#appRepoDir, 'cat-file', 'blob', ref,
+    ]);
+    return parseSopPlan(stdout, version);
+  }
+
+  /** Advances one SOP run through the core; no single Worker Pi is started. */
+  async #advanceSop(run, candidate, repoEntry, control) {
+    const pin = control.prepare?.template ?? candidate.pinnedTemplate;
+    // A definite failure must not release the concurrency slot while a Pi the
+    // core started is still unconfirmed.
+    const failOrHold = (reason) =>
+      this.#sopTasksUnconfirmed(control)
+        ? this.#hold(run, `${reason}；存在未确认 Pi，保持运行占用`)
+        : this.#fail(run, reason);
+    if (typeof pin?.sopRef !== 'string' || pin.sopRef.length === 0) {
+      failOrHold('固定模板缺少 SOP 计划引用 sopRef，拒绝执行');
+      return;
+    }
+    let plan;
+    try {
+      plan = await this.#loadSopPlan(pin.sopRef, pin.version);
+    } catch (error) {
+      failOrHold(`SOP 计划不可用：${errorMessage(error)}`);
+      return;
+    }
+
+    const persist = (next) => this.#writeControl(run.id, next);
+    const valid = () => {
+      try {
+        const current = this.#wf.getCandidate(run.candidateId);
+        return Boolean(
+          current.activeRunId === run.id &&
+            !current.draftStale &&
+            current.draft?.rev === run.draftRev &&
+            current.decision?.action === 'develop' &&
+            current.decision.actor === 'user' &&
+            current.decision.draftRev === current.draft?.rev,
+        );
+      } catch {
+        return false;
+      }
+    };
+    // Losing authorization must stop started lanes and start nothing new; the
+    // core turns this flag into a confirmed block on its next advance.
+    if (!valid() && isObject(control.sop) && !control.sop.stopPending) {
+      control.sop.stopPending = true;
+      control.sop.blockReason = '开发授权已失效：任务稿或源内容已变化';
+      this.#writeControl(run.id, control);
+    }
+
+    let outcome;
+    try {
+      outcome = await advanceDevelopmentSop({
+        run, control, plan, repoEntry,
+        workspace: this.#workspace, pi: this.#pi,
+        persist, valid, closing: () => this.#closing,
+      });
+    } catch (error) {
+      failOrHold(`SOP 推进失败：${errorMessage(error)}`);
+      return;
+    }
+
+    const state = outcome?.state;
+    if (state === 'completed' && isObject(outcome.result)) {
+      await this.#deliver(run, control, null, outcome.result);
+    } else if (state === 'completed') {
+      failOrHold('SOP 推进结束但缺少有效结果，拒绝交付');
+    } else if (state === 'blocked') {
+      this.#fail(run, outcome.reason ?? 'SOP 推进阻塞');
+    } else if (state === 'hold') {
+      this.#hold(run, outcome.reason ?? 'SOP 现场未确认');
+    } else if (state !== 'pending') {
+      failOrHold(`SOP 推进返回未知状态：${String(state)}`);
+    }
+  }
+
   async #prepareRun(run, candidate, repoEntry, control) {
     const workflow = this.#wf;
-    const pin = candidate.pinnedTemplate;
+    const pin = control.prepare?.template ?? candidate.pinnedTemplate;
     if (!pin || pin.draftRev !== candidate.draft?.rev) {
       this.#fail(run, '开发授权缺少与当前任务稿对应的固定模板，拒绝执行');
       return null;
@@ -2297,7 +2483,7 @@ export class Runtime {
     await this.#deliver(run, control, status);
   }
 
-  async #deliver(run, control, status) {
+  async #deliver(run, control, status, resultOverride) {
     const workflow = this.#wf;
     let rawResult = null;
     let resultError = null;
@@ -2308,7 +2494,9 @@ export class Runtime {
     }
     let result;
     try {
-      if (rawResult === null) {
+      if (resultOverride !== undefined) {
+        result = normalizeWorkerResult(resultOverride);
+      } else if (rawResult === null) {
         if (resultError) {
           throw new Error(resultError);
         }
@@ -2366,6 +2554,7 @@ export class Runtime {
           baseCommit: control.prepare.baseCommit,
           writeScopes: candidate.draft.writeScopes,
           summary: result.summary,
+          testedTree: isSopRun(run) ? control.sop.testedTree : undefined,
         });
       } catch (error) {
         this.#fail(run, `提交或推送失败：${errorMessage(error)}`);
@@ -2428,7 +2617,8 @@ export class Runtime {
       });
       return;
     }
-    if (live.headSha.toLowerCase() !== control.delivery.pr.headSha.toLowerCase()) {
+    if (live.headSha.toLowerCase() !== control.delivery.headSha.toLowerCase() ||
+        live.headSha.toLowerCase() !== control.delivery.pr.headSha.toLowerCase()) {
       control.delivery.note = `Pull Request head 已变为 ${live.headSha}，与推送的 ${control.delivery.pr.headSha} 不一致，等待人工核对`;
       this.#writeControl(run.id, control);
       workflow.recordEvent({
@@ -2477,6 +2667,16 @@ export class Runtime {
       '',
       '## 证据',
       ...(evidenceLines.length > 0 ? evidenceLines : ['- 无']),
+      ...(candidate.pinnedTemplate?.id === SOP_TEMPLATE_ID
+        ? [
+            '',
+            '## SOP',
+            `- SOP：${candidate.pinnedTemplate.id}@${candidate.pinnedTemplate.version}`,
+            `- 任务稿：${candidate.id}@${run.draftRev}`,
+            `- 计划：${candidate.pinnedTemplate.sopRef}`,
+            `- 验收项：${candidate.draft.acceptance.join('；')}`,
+          ]
+        : []),
       '',
       '合并需用户明确确认；此 PR 由 auto-ai 准备，不自动合并。',
     ].join('\n');
@@ -2507,6 +2707,32 @@ export class Runtime {
     );
     if (!repoEntry?.localPath) {
       return;
+    }
+    if (isSopRun(run)) {
+      // Lane worktrees are reclaimed now that the parent PR head is recorded.
+      // Per-lane failures are recorded and never block the parent archive below.
+      try {
+        const lanes = await archiveDevelopmentSop({
+          control,
+          workspace: this.#workspace,
+          repoEntry,
+          run,
+        });
+        control.sopArchive = { lanes, at: now() };
+      } catch (error) {
+        control.sopArchive = { lanes: [], error: errorMessage(error), at: now() };
+      }
+      this.#writeControl(run.id, control);
+      const summary = control.sopArchive.lanes
+        .map((lane) => `${lane.step} ${lane.removed ? '已回收' : `保留（${lane.reason ?? '未知'}）`}`)
+        .join('；');
+      workflow.recordEvent({
+        kind: 'run.sop_archived',
+        message: `Run ${run.id} 的 lane 回收：${summary || control.sopArchive.error || '无 lane 记录'}`,
+        candidateId: run.candidateId,
+        runId: run.id,
+        repo: run.repo,
+      });
     }
     let archive;
     try {

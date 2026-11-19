@@ -853,6 +853,7 @@ export class WorkspaceAdapter {
     baseCommit,
     writeScopes,
     summary,
+    testedTree,
   } = {}) {
     const targetRepo = requireRepo(repo);
     const commitSummary = requireTrimmedString(summary, 'summary');
@@ -867,9 +868,16 @@ export class WorkspaceAdapter {
       baseCommit,
     });
 
+    const requireTestedTree = async (ref) => {
+      if (testedTree === undefined) return;
+      const { stdout } = await this.#git(context.targetPath,
+        ref ? ['rev-parse', `${ref}^{tree}`] : ['write-tree'], '核对通过测试与评审的 Git tree');
+      if (stdout.trim() !== testedTree) throw new Error('提交内容与通过测试、评审的 SOP 产物不一致');
+    };
     const before = await this.inspect({ worktreePath: context.targetPath });
     await this.#assertDeliveryScopes(context, scopes, before);
     if (!before.dirty) {
+      await requireTestedTree(before.headSha);
       const remoteSha = await this.#remoteBranchSha(context.targetPath, context.targetBranch);
       if (remoteSha === before.headSha) {
         return {
@@ -915,9 +923,10 @@ export class WorkspaceAdapter {
 
     await this.#git(
       context.targetPath,
-      ['add', '-A', '--', ...before.paths],
+      ['--literal-pathspecs', 'add', '-A', '--', ...before.paths],
       `暂存 ${worktreePath} 的变更`,
     );
+    await requireTestedTree();
     const staged = await this.#git(
       context.targetPath,
       ['diff', '--cached', '--name-only', '-z'],
@@ -954,6 +963,7 @@ export class WorkspaceAdapter {
     if (!COMMIT_PATTERN.test(headSha)) {
       throw new Error('提交后的 HEAD 不是有效提交 SHA');
     }
+    await requireTestedTree(headSha);
 
     const afterCommit = await this.inspect({ worktreePath: context.targetPath });
     await this.#assertDeliveryScopes(context, scopes, afterCommit);
@@ -1209,6 +1219,82 @@ export class WorkspaceAdapter {
     return {
       removed: true,
       reason: note ?? '工作树已确认干净且推送后移除，任务分支引用保留',
+    };
+  }
+
+  /**
+   * Removes a lane worktree after the SOP has already read back the parent PR
+   * and preserved the lane's unique changes. Lanes never push, so unlike
+   * `archive` there is no remote assertion: it only proves the tree belongs to
+   * this repo's runId manifest, sits at baseCommit and is clean. Manifest and
+   * branch ref are kept as evidence.
+   */
+  async archiveLane({ repo, localPath, worktreePath, runId, baseCommit } = {}) {
+    const targetRepo = requireRepo(repo);
+    const sourcePath = requireAbsolutePath(localPath, 'localPath');
+    const targetPath = requireAbsolutePath(worktreePath, 'worktreePath');
+    const targetRunId = requireRunId(runId);
+    const targetBase = requireCommit(baseCommit, 'baseCommit');
+
+    const loaded = await this.#readManifestByRunId(targetRunId);
+    if (!loaded) {
+      return { removed: false, reason: `没有找到 runId ${targetRunId} 的 manifest，保留现场` };
+    }
+    const { manifest } = loaded;
+    if ((await this.#safeRealpath(sourcePath)) !== (await this.#safeRealpath(manifest.localPath))) {
+      return {
+        removed: false,
+        reason: `runId ${targetRunId} 绑定的源仓库为 ${manifest.localPath}，与 ${localPath} 不一致，保留现场`,
+      };
+    }
+    if ((await this.#safeRealpath(targetPath)) !== (await this.#safeRealpath(manifest.worktreePath))) {
+      return {
+        removed: false,
+        reason: `runId ${targetRunId} 绑定的工作树为 ${manifest.worktreePath}，与 ${worktreePath} 不一致，保留现场`,
+      };
+    }
+
+    try {
+      await this.#assertDeliveryContext({
+        repo: targetRepo,
+        worktreePath: manifest.worktreePath,
+        branch: manifest.branch,
+        baseCommit: targetBase,
+      });
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    const head = await this.#tryGit(manifest.worktreePath, ['rev-parse', 'HEAD']);
+    if (!head || head.stdout.trim().toLowerCase() !== targetBase.toLowerCase()) {
+      return { removed: false, reason: `工作树 HEAD 不在基线 ${targetBase}，保留现场` };
+    }
+
+    let inspected;
+    try {
+      inspected = await this.inspect({ worktreePath: manifest.worktreePath });
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    if (inspected.dirty) {
+      return {
+        removed: false,
+        reason: `工作树存在未提交或未跟踪修改（${inspected.paths.length} 个路径），保留现场`,
+      };
+    }
+
+    try {
+      await this.#git(
+        sourcePath,
+        ['worktree', 'remove', '--', manifest.worktreePath],
+        `移除工作树 ${manifest.worktreePath}`,
+      );
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+
+    return {
+      removed: true,
+      reason: '工作树已确认干净且停在基线后移除，manifest 与任务分支引用保留',
     };
   }
 }

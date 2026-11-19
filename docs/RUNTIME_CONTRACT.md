@@ -49,6 +49,18 @@ Candidate.draft.rev 是 Workflow 当前的裸 SHA，requirementsRev 是 `sha256:
 8. 起动时核对 Pi request/process/result 与 workspace manifest；已完成运行继续收尾，仍运行接管，unknown 停派同范围。单个运行或仓库的错误不能中断其他任务。旧整理记录缺少 promptRef/promptText 时仍可按 taskId 保守接管，但不能据此重写提示。中断在 `starting` 的整理记录按同一 task id 只读核对 Pi 现场：请求存在则接管（running，或 monitor 身份未确认时 `unconfirmed`），不存在或读取失败则记为具体 `failed` 阻塞，不重新调用模型。`unconfirmed` 期间（含显式 requestDraft）不得为同一候选启动新的 taskId；待原任务给出最终结果后按正常迟到结果保护应用或丢弃。
 9. Issue 发布/验收/合并前只读刷新源内容，发现版本改变使授权失效。GitHubAdapter 可新增 `readIssue({repo,number})`，使用与 collect 相同归一化。
 
+## SOP 执行（development-sop）
+
+`templateId: development-sop` 选择显式双路 SOP；其余模板仍走单 Worker。准备步骤不变，之后不启动单 Worker Pi，改由 `src/development-sop.mjs` 推进。
+
+- 路由以 Run 自身的 `draftSnapshot.templateId` 判定，固定 pin 取 `control.prepare.template`（首次准备用 candidate 的 pin）。改稿或源变化清空 candidate pin 或决定时，在途 Run 仍按原路线推进，不会误走单 Worker 或释放错资源。
+- 决定时用已解析模板的 commit/id/version 固定 `sopRef=<commit>:templates/development-sop/<version>.yaml`；`draft.context` 只由核心 `parseSopTask` 校验，Runtime 不复制字段或路径校验，也不改写批准稿。
+- 执行前从 `pin.sopRef` 读取该 YAML 作为 `plan`（同 commit，不读工作树）。核心返回 `{state, result?, reason?}`：`pending` 保持运行，`completed` 的 result 交给既有 `#deliver`，`blocked` 记阻塞，`hold` 保留占用。
+- Runtime 传 `persist(control?)`、`valid()`（按实时 workflow 授权与固定稿版本返回 boolean）与 `closing()`；授权失效时 Runtime 置 `control.sop.stopPending`，核心在下次推进时确认已启动 Pi 全部停止后才阻塞，不再派新子步骤。任何失败路径若仍有未确认 Pi，Runtime 只 hold、不释放并发槽位。
+- 测试前后核对两路汇总的 Git tree；独立 reviewer 读取该 tree 的完整文本 diff，提交器只推送与它一致的 commit。PR 正文追加 SOP ID、`候选@draftRev`、`sopRef` 与验收项；仍是一个 PR、不自动合并。
+- SOP Run 的 `cancelRun` 先等 `tick` 排空，再用进程内标记阻止 tick 推进该 Run，然后调用 `cancelDevelopmentSop`；`completed`（已通过、等待交付）直接用已保存结果走 `#deliver`，不受取消标记或 `cancelRequested` 影响且不新建 lane；仅 `cancelled` 才阻塞原 Run，`unknown` 保持 running 占用。
+- 父 PR 读回并保存结果后，`#archiveRun` 调用核心 `archiveDevelopmentSop({control,workspace,repoEntry,run})` 回收两路；核心先核对 lane 产物哈希与父交付 commit 的 blob，再用 `archiveLane` 移除。逐 lane 结果写入 `control.sopArchive` 并记事件；回收失败只记录，不阻断父工作树既有归档。
+
 ## 验收与合并
 
 需求整理、后台 tick、两种验收都不能发合并。只有 merge 方法收到 confirmed=true、当前双角色批准、expectedHeadSha 与实际一致才可发送。用户当前未配置额外监督线程，设计监督在主会话核验后由本地界面记录实际结论，不能伪造角色审批。

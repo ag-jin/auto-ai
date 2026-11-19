@@ -58,7 +58,7 @@ Candidate.draft.rev 是 Workflow 当前的裸 SHA，requirementsRev 是 `sha256:
 - 执行前从 `pin.sopRef` 读取该 YAML 作为 `plan`（同 commit，不读工作树）。核心返回 `{state, result?, reason?}`：`pending` 保持运行，`completed` 的 result 交给既有 `#deliver`，`blocked` 记阻塞，`hold` 保留占用。
 - Runtime 传 `persist(control?)`、`valid()`（按实时 workflow 授权与固定稿版本返回 boolean）与 `closing()`；授权失效时 Runtime 置 `control.sop.stopPending`，核心在下次推进时确认已启动 Pi 全部停止后才阻塞，不再派新子步骤。任何失败路径若仍有未确认 Pi，Runtime 只 hold、不释放并发槽位。
 - 测试前后核对两路汇总的 Git tree；独立 reviewer 读取该 tree 的完整文本 diff，提交器只推送与它一致的 commit。PR 正文追加 SOP ID、`候选@draftRev`、`sopRef` 与验收项；仍是一个 PR、不自动合并。
-- SOP Run 的 `cancelRun` 先等 `tick` 排空，再用进程内标记阻止 tick 推进该 Run，然后调用 `cancelDevelopmentSop`；`completed`（已通过、等待交付）直接用已保存结果走 `#deliver`，不受取消标记或 `cancelRequested` 影响且不新建 lane；仅 `cancelled` 才阻塞原 Run，`unknown` 保持 running 占用。
+- SOP Run 的 `cancelRun` 先等 `tick` 排空，再用进程内标记阻止 tick 推进该 Run，然后调用 `cancelDevelopmentSop`；`completed`（已通过、等待交付）直接用已保存结果走 `#deliver`，不受取消标记或 `cancelRequested` 影响且不新建 lane；重复取消尚在确认中的 SOP 返回 `cancelling`（`stopped: false`）；仅 `cancelled` 才阻塞原 Run，`unknown` 保持 running 占用。
 - 父 PR 读回并保存结果后，`#archiveRun` 调用核心 `archiveDevelopmentSop({control,workspace,repoEntry,run})` 回收两路；核心把 lane 路径、记录哈希与父交付 head 交给 `archiveLane`，后者先核对 manifest 归属、基线及父交付 blob，再清理该唯一交付文件并移除工作树。逐 lane 结果写入 `control.sopArchive` 并记事件；回收失败只记录，不阻断父工作树既有归档。
 
 ## 验收与合并

@@ -266,7 +266,14 @@ class DevelopmentSop {
     return `你是双路开发 SOP（${DEVELOPMENT_SOP_ID}）的独立开发 Worker：lane ${lane.id}。
 - 唯一允许修改的文件：${lane.path}（仓库内相对路径），可创建或整文件覆盖。
 - 不得改其它文件、不得创建符号链接、不得运行 git、不得安装依赖或联网。
-- 完成后只输出一个 YAML 映射：sop: ${DEVELOPMENT_SOP_ID} / template: ${state.plan.handoff} / draft_rev: ${state.task.draftRev} / step: ${lane.id} / artifact: ${lane.path}
+- 完成后只输出以下五个键的 YAML，不增加 summary、说明或其他键：
+\`\`\`yaml
+sop: ${DEVELOPMENT_SOP_ID}
+template: ${state.plan.handoff}
+draft_rev: ${state.task.draftRev}
+step: ${lane.id}
+artifact: ${lane.path}
+\`\`\`
 ${rework}## 已批准任务稿（只读）
 - 目标：${state.task.goal}
 - 验收（自然语言原文）：${state.task.acceptance.join('\n')}

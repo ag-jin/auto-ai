@@ -18,6 +18,10 @@ const ACTIVE_RUN_STATUS = 'running';
 const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const TEMPLATE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TEMPLATE_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+// Only this template runs the versioned two-lane SOP. It is the single place a
+// parent Run reserves a second concurrency slot and pins the SOP YAML.
+const SOP_TEMPLATE_ID = 'development-sop';
+const SOP_TEMPLATE_SLOTS = 2;
 
 const STATE_REASONS = {
   candidate: '候选尚未形成任务稿',
@@ -247,7 +251,42 @@ function normalizePinnedTemplate(value) {
   if (templatePath !== expectedPath) {
     throw new Error(`decision.template.path 与 id/版本不一致，应为 ${expectedPath}`);
   }
-  return { commit, path: templatePath, id, version, templateRef: `${commit}:${templatePath}` };
+  const templateRef = `${commit}:${templatePath}`;
+  const pin = { commit, path: templatePath, id, version, templateRef };
+  const hasSopRef = value.sopRef !== undefined && value.sopRef !== null;
+  if (id !== SOP_TEMPLATE_ID) {
+    if (hasSopRef) {
+      throw new Error(`decision.template.sopRef 只能用于 ${SOP_TEMPLATE_ID} 模板`);
+    }
+    return pin;
+  }
+  // The SOP method is defined by the YAML next to the pinned Markdown at the
+  // same commit. A missing or mismatched YAML reference would leave the Run
+  // without its only flow definition, so it is rejected instead of defaulted.
+  const expectedSopPath = `templates/${id}/${version}.yaml`;
+  if (!hasSopRef) {
+    throw new Error(
+      `decision.template.sopRef 必须固定同 commit 的 ${expectedSopPath}`,
+    );
+  }
+  const sopRef = requireTrimmedString(value.sopRef, 'decision.template.sopRef');
+  const expectedSopRef = `${commit}:${expectedSopPath}`;
+  if (sopRef !== expectedSopRef) {
+    throw new Error(
+      `decision.template.sopRef 必须是同 commit 的 ${expectedSopPath}，应为 ${expectedSopRef}`,
+    );
+  }
+  pin.sopRef = sopRef;
+  return pin;
+}
+
+/**
+ * Concurrency slots a Run needs for its whole lifetime. Only the explicit
+ * `development-sop` template runs two lanes in parallel, so its parent Run
+ * reserves two slots; every other template keeps the historical single slot.
+ */
+function draftSlots(draft) {
+  return draft && draft.templateId === SOP_TEMPLATE_ID ? SOP_TEMPLATE_SLOTS : 1;
 }
 
 function scopesConflict(left, right) {
@@ -791,6 +830,15 @@ export class Workflow {
       }
 
       const decidedRev = candidate.draft ? candidate.draft.rev : null;
+      if (
+        action === 'develop' &&
+        candidate.draft.templateId === SOP_TEMPLATE_ID &&
+        input.template === undefined
+      ) {
+        throw new Error(
+          `候选 ${id} 的 ${SOP_TEMPLATE_ID} 任务稿必须在批准时固定模板与同 commit 的 SOP YAML`,
+        );
+      }
       const pinnedTemplate =
         action === 'develop' && input.template !== undefined && decidedRev !== null
           ? { ...normalizePinnedTemplate(input.template), draftRev: decidedRev }
@@ -1755,30 +1803,43 @@ export class Workflow {
       }
     }
 
-    const globalCount = this.#store.get(
-      "SELECT COUNT(*) AS count FROM runs WHERE status = 'running'",
-    ).count;
-    if (globalCount >= settings.concurrency.global) {
-      deny(`全局并发已达到上限 ${settings.concurrency.global}（运行中 ${globalCount}）`);
+    // Every running Run reserves slots for its whole lifetime: two for an
+    // explicit development-sop parent Run (read from its task snapshot), one
+    // otherwise. Admitting a candidate therefore compares used + needed slots
+    // against both limits instead of assuming one slot per Run.
+    const activeRuns = this.#store.all(
+      "SELECT id, candidate_id, repo, draft_snapshot FROM runs WHERE status = 'running'",
+    );
+    const neededSlots = draftSlots(draft);
+    let usedGlobalSlots = 0;
+    let usedRepoSlots = 0;
+    for (const activeRun of activeRuns) {
+      const slots = draftSlots(JSON.parse(activeRun.draft_snapshot));
+      usedGlobalSlots += slots;
+      if (activeRun.repo.toLowerCase() === candidate.issue.repo.toLowerCase()) {
+        usedRepoSlots += slots;
+      }
     }
-    const repoCount = this.#store.get(
-      "SELECT COUNT(*) AS count FROM runs WHERE status = 'running' AND lower(repo) = lower(?)",
-      candidate.issue.repo,
-    ).count;
-    if (repoCount >= settings.concurrency.perRepo) {
-      deny(`仓库 ${candidate.issue.repo} 并发已达到上限 ${settings.concurrency.perRepo}`);
+    if (usedGlobalSlots + neededSlots > settings.concurrency.global) {
+      deny(
+        `全局并发已达到上限 ${settings.concurrency.global}` +
+          `（已占用 ${usedGlobalSlots} 槽，需要 ${neededSlots} 槽）`,
+      );
+    }
+    if (usedRepoSlots + neededSlots > settings.concurrency.perRepo) {
+      deny(
+        `仓库 ${candidate.issue.repo} 并发已达到上限 ${settings.concurrency.perRepo}` +
+          `（已占用 ${usedRepoSlots} 槽，需要 ${neededSlots} 槽）`,
+      );
     }
 
     if (draft) {
-      const activeRuns = this.#store.all(
-        `SELECT runs.id, runs.candidate_id, runs.draft_snapshot
-           FROM runs
-          WHERE runs.status = 'running' AND lower(runs.repo) = lower(?)`,
-        candidate.issue.repo,
-      );
       const conflicts = [];
       for (const activeRun of activeRuns) {
-        if (activeRun.candidate_id === candidate.id) {
+        if (
+          activeRun.candidate_id === candidate.id ||
+          activeRun.repo.toLowerCase() !== candidate.issue.repo.toLowerCase()
+        ) {
           continue;
         }
         const activeDraft = JSON.parse(activeRun.draft_snapshot);

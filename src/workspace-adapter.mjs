@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   lstat,
   mkdir,
@@ -142,6 +143,15 @@ function requireAbsolutePath(value, name) {
     throw new Error(`${name} 必须是绝对路径`);
   }
   return path.resolve(normalized);
+}
+
+function requireRepoFile(value, name) {
+  const normalized = requireTrimmedString(value, name);
+  const bad = normalized.split('/').some((segment) => !segment || segment === '.' || segment === '..');
+  if (normalized.startsWith('/') || normalized.includes('\\') || bad) {
+    throw new Error(`${name} 必须是仓库内相对路径`);
+  }
+  return normalized;
 }
 
 function requireCommit(value, name) {
@@ -853,6 +863,7 @@ export class WorkspaceAdapter {
     baseCommit,
     writeScopes,
     summary,
+    testedTree,
   } = {}) {
     const targetRepo = requireRepo(repo);
     const commitSummary = requireTrimmedString(summary, 'summary');
@@ -867,9 +878,16 @@ export class WorkspaceAdapter {
       baseCommit,
     });
 
+    const requireTestedTree = async (ref) => {
+      if (testedTree === undefined) return;
+      const { stdout } = await this.#git(context.targetPath,
+        ref ? ['rev-parse', `${ref}^{tree}`] : ['write-tree'], '核对通过测试与评审的 Git tree');
+      if (stdout.trim() !== testedTree) throw new Error('提交内容与通过测试、评审的 SOP 产物不一致');
+    };
     const before = await this.inspect({ worktreePath: context.targetPath });
     await this.#assertDeliveryScopes(context, scopes, before);
     if (!before.dirty) {
+      await requireTestedTree(before.headSha);
       const remoteSha = await this.#remoteBranchSha(context.targetPath, context.targetBranch);
       if (remoteSha === before.headSha) {
         return {
@@ -915,9 +933,10 @@ export class WorkspaceAdapter {
 
     await this.#git(
       context.targetPath,
-      ['add', '-A', '--', ...before.paths],
+      ['--literal-pathspecs', 'add', '-A', '--', ...before.paths],
       `暂存 ${worktreePath} 的变更`,
     );
+    await requireTestedTree();
     const staged = await this.#git(
       context.targetPath,
       ['diff', '--cached', '--name-only', '-z'],
@@ -954,6 +973,7 @@ export class WorkspaceAdapter {
     if (!COMMIT_PATTERN.test(headSha)) {
       throw new Error('提交后的 HEAD 不是有效提交 SHA');
     }
+    await requireTestedTree(headSha);
 
     const afterCommit = await this.inspect({ worktreePath: context.targetPath });
     await this.#assertDeliveryScopes(context, scopes, afterCommit);
@@ -1209,6 +1229,135 @@ export class WorkspaceAdapter {
     return {
       removed: true,
       reason: note ?? '工作树已确认干净且推送后移除，任务分支引用保留',
+    };
+  }
+
+  /**
+   * Removes a lane worktree after the SOP has already read back the parent PR
+   * and preserved the lane's unique changes. Lanes never push, so unlike
+   * `archive` there is no remote assertion: it proves the tree belongs to this
+   * repo's runId manifest, the parent commit carries the delivered blob, and the
+   * tree sits at baseCommit before cleaning that one file and removing it.
+   * Manifest and branch ref are kept as evidence.
+   */
+  async archiveLane({
+    repo, localPath, worktreePath, runId, baseCommit,
+    deliveredFile, deliveredHash, parentPath, parentHead,
+  } = {}) {
+    const targetRepo = requireRepo(repo);
+    const sourcePath = requireAbsolutePath(localPath, 'localPath');
+    const targetPath = requireAbsolutePath(worktreePath, 'worktreePath');
+    const targetRunId = requireRunId(runId);
+    const targetBase = requireCommit(baseCommit, 'baseCommit');
+    const targetFile = requireRepoFile(deliveredFile, 'deliveredFile');
+    const targetHash = requireTrimmedString(deliveredHash, 'deliveredHash');
+    if (!/^[0-9a-f]{64}$/.test(targetHash)) throw new Error('deliveredHash 必须是 sha256 十六进制');
+    const parentRepo = requireAbsolutePath(parentPath, 'parentPath');
+    const parentCommit = requireCommit(parentHead, 'parentHead');
+
+    const loaded = await this.#readManifestByRunId(targetRunId);
+    if (!loaded) {
+      return { removed: false, reason: `没有找到 runId ${targetRunId} 的 manifest，保留现场` };
+    }
+    const { manifest } = loaded;
+    if ((await this.#safeRealpath(sourcePath)) !== (await this.#safeRealpath(manifest.localPath))) {
+      return {
+        removed: false,
+        reason: `runId ${targetRunId} 绑定的源仓库为 ${manifest.localPath}，与 ${localPath} 不一致，保留现场`,
+      };
+    }
+    if ((await this.#safeRealpath(targetPath)) !== (await this.#safeRealpath(manifest.worktreePath))) {
+      return {
+        removed: false,
+        reason: `runId ${targetRunId} 绑定的工作树为 ${manifest.worktreePath}，与 ${worktreePath} 不一致，保留现场`,
+      };
+    }
+
+    try {
+      await this.#assertDeliveryContext({
+        repo: targetRepo,
+        worktreePath: manifest.worktreePath,
+        branch: manifest.branch,
+        baseCommit: targetBase,
+      });
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    const head = await this.#tryGit(manifest.worktreePath, ['rev-parse', 'HEAD']);
+    if (!head || head.stdout.trim().toLowerCase() !== targetBase.toLowerCase()) {
+      return { removed: false, reason: `工作树 HEAD 不在基线 ${targetBase}，保留现场` };
+    }
+
+    const file = path.join(manifest.worktreePath, targetFile);
+    let stat;
+    try {
+      stat = await lstat(file);
+    } catch {
+      return { removed: false, reason: `交付文件不存在：${targetFile}` };
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      return { removed: false, reason: '交付文件不是普通文件，保留现场' };
+    }
+    if (createHash('sha256').update(await readFile(file)).digest('hex') !== targetHash) {
+      return { removed: false, reason: 'lane 文件与记录哈希不一致，保留现场' };
+    }
+    let blob;
+    try {
+      blob = await this.#git(
+        parentRepo,
+        ['cat-file', 'blob', `${parentCommit}:${targetFile}`],
+        `读取父交付 ${targetFile}`,
+      );
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    if (createHash('sha256').update(blob.stdout).digest('hex') !== targetHash) {
+      return { removed: false, reason: '父交付 commit 的 blob 与 lane 产物不一致，保留现场' };
+    }
+    try {
+      const atBase = await this.#tryGit(manifest.worktreePath, [
+        'cat-file', '-e', `${targetBase}:${targetFile}`,
+      ]);
+      if (atBase) {
+        await this.#git(
+          manifest.worktreePath,
+          ['restore', '--staged', '--worktree', '--', targetFile],
+          `还原 ${targetFile}`,
+        );
+      } else {
+        await this.#tryGit(manifest.worktreePath, ['rm', '--cached', '-f', '--', targetFile]);
+        await rm(file, { force: false });
+      }
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+
+    let inspected;
+    try {
+      inspected = await this.inspect({ worktreePath: manifest.worktreePath });
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    if (inspected.dirty) {
+      return {
+        removed: false,
+        reason: `工作树存在未提交或未跟踪修改（${inspected.paths.length} 个路径），保留现场`,
+      };
+    }
+
+    try {
+      await this.#git(
+        sourcePath,
+        ['worktree', 'remove', '--', manifest.worktreePath],
+        `移除工作树 ${manifest.worktreePath}`,
+      );
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+
+    return {
+      removed: true,
+      reason: '工作树已确认干净且停在基线后移除，manifest 与任务分支引用保留',
     };
   }
 }

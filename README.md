@@ -35,6 +35,7 @@ flowchart LR
 
 - [默认模板目录](templates/catalog.yml)：主会话从这里找到当前采用的版本。
 - [开发交付 v1.2.0](templates/development/1.2.0.md)：确认、并行执行、核验、交付；保留 v1.0.0/v1.1.0 固定引用。
+- [双路 SOP 开发 v1.0.0](templates/development-sop/1.0.0.md)：批准稿固定、两路独立实现、定向返工与独立复核，一个 Run 交付一个 PR。
 - [调研交付 v1.0.0](templates/research/1.0.0.md)：收敛问题、核对来源、比较与结论。
 - [GitHub 任务表单](.github/ISSUE_TEMPLATE/task.yml)：只收集输入，执行方法由主会话选择。
 
@@ -73,7 +74,7 @@ npm start -- --host 127.0.0.1 --port 4310 --data-dir /absolute/data --app-repo-d
 ## 验证
 
 ```sh
-npm test                  # 当前 101 项项目测试
+npm test                  # 项目测试
 npm run check:workflow    # 18 项独立领域检查
 npm run check:trial       # 35 项执行包检查
 npm run check:runtime     # 真实临时 Git + 隔离 Pi/GitHub 的闭环

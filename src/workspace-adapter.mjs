@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   lstat,
   mkdir,
@@ -142,6 +143,15 @@ function requireAbsolutePath(value, name) {
     throw new Error(`${name} 必须是绝对路径`);
   }
   return path.resolve(normalized);
+}
+
+function requireRepoFile(value, name) {
+  const normalized = requireTrimmedString(value, name);
+  const bad = normalized.split('/').some((segment) => !segment || segment === '.' || segment === '..');
+  if (normalized.startsWith('/') || normalized.includes('\\') || bad) {
+    throw new Error(`${name} 必须是仓库内相对路径`);
+  }
+  return normalized;
 }
 
 function requireCommit(value, name) {
@@ -1225,16 +1235,25 @@ export class WorkspaceAdapter {
   /**
    * Removes a lane worktree after the SOP has already read back the parent PR
    * and preserved the lane's unique changes. Lanes never push, so unlike
-   * `archive` there is no remote assertion: it only proves the tree belongs to
-   * this repo's runId manifest, sits at baseCommit and is clean. Manifest and
-   * branch ref are kept as evidence.
+   * `archive` there is no remote assertion: it proves the tree belongs to this
+   * repo's runId manifest, the parent commit carries the delivered blob, and the
+   * tree sits at baseCommit before cleaning that one file and removing it.
+   * Manifest and branch ref are kept as evidence.
    */
-  async archiveLane({ repo, localPath, worktreePath, runId, baseCommit } = {}) {
+  async archiveLane({
+    repo, localPath, worktreePath, runId, baseCommit,
+    deliveredFile, deliveredHash, parentPath, parentHead,
+  } = {}) {
     const targetRepo = requireRepo(repo);
     const sourcePath = requireAbsolutePath(localPath, 'localPath');
     const targetPath = requireAbsolutePath(worktreePath, 'worktreePath');
     const targetRunId = requireRunId(runId);
     const targetBase = requireCommit(baseCommit, 'baseCommit');
+    const targetFile = requireRepoFile(deliveredFile, 'deliveredFile');
+    const targetHash = requireTrimmedString(deliveredHash, 'deliveredHash');
+    if (!/^[0-9a-f]{64}$/.test(targetHash)) throw new Error('deliveredHash 必须是 sha256 十六进制');
+    const parentRepo = requireAbsolutePath(parentPath, 'parentPath');
+    const parentCommit = requireCommit(parentHead, 'parentHead');
 
     const loaded = await this.#readManifestByRunId(targetRunId);
     if (!loaded) {
@@ -1267,6 +1286,50 @@ export class WorkspaceAdapter {
     const head = await this.#tryGit(manifest.worktreePath, ['rev-parse', 'HEAD']);
     if (!head || head.stdout.trim().toLowerCase() !== targetBase.toLowerCase()) {
       return { removed: false, reason: `工作树 HEAD 不在基线 ${targetBase}，保留现场` };
+    }
+
+    const file = path.join(manifest.worktreePath, targetFile);
+    let stat;
+    try {
+      stat = await lstat(file);
+    } catch {
+      return { removed: false, reason: `交付文件不存在：${targetFile}` };
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      return { removed: false, reason: '交付文件不是普通文件，保留现场' };
+    }
+    if (createHash('sha256').update(await readFile(file)).digest('hex') !== targetHash) {
+      return { removed: false, reason: 'lane 文件与记录哈希不一致，保留现场' };
+    }
+    let blob;
+    try {
+      blob = await this.#git(
+        parentRepo,
+        ['cat-file', 'blob', `${parentCommit}:${targetFile}`],
+        `读取父交付 ${targetFile}`,
+      );
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
+    }
+    if (createHash('sha256').update(blob.stdout).digest('hex') !== targetHash) {
+      return { removed: false, reason: '父交付 commit 的 blob 与 lane 产物不一致，保留现场' };
+    }
+    try {
+      const atBase = await this.#tryGit(manifest.worktreePath, [
+        'cat-file', '-e', `${targetBase}:${targetFile}`,
+      ]);
+      if (atBase) {
+        await this.#git(
+          manifest.worktreePath,
+          ['restore', '--staged', '--worktree', '--', targetFile],
+          `还原 ${targetFile}`,
+        );
+      } else {
+        await this.#tryGit(manifest.worktreePath, ['rm', '--cached', '-f', '--', targetFile]);
+        await rm(file, { force: false });
+      }
+    } catch (error) {
+      return { removed: false, reason: redact(error.message) };
     }
 
     let inspected;

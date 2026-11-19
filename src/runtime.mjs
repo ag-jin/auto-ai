@@ -54,7 +54,6 @@ const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 86400;
 // The requirements method is versioned Git content, never a hard-coded prompt.
 const REQUIREMENTS_TEMPLATE_ID = 'requirements';
-// One explicit template id selects the versioned two-lane SOP route.
 const SOP_TEMPLATE_ID = 'development-sop';
 const execFileAsync = promisify(execFile);
 
@@ -2102,7 +2101,6 @@ export class Runtime {
     }
 
     if (isSopRun(run)) {
-      // SOP route: the frozen plan drives the run; no single Worker Pi starts.
       await this.#advanceSop(run, candidate, repoEntry, control);
       return;
     }
@@ -2139,7 +2137,6 @@ export class Runtime {
     return parseSopPlan(stdout, version);
   }
 
-  /** Advances one SOP run through the core; no single Worker Pi is started. */
   async #advanceSop(run, candidate, repoEntry, control) {
     const pin = control.prepare?.template ?? candidate.pinnedTemplate;
     // A definite failure must not release the concurrency slot while a Pi the
@@ -2653,6 +2650,7 @@ export class Runtime {
     const evidenceLines = result.evidence.map(
       (item) => `- [${item.status}] \`${item.command}\`：${item.detail}`,
     );
+    const pin = control.prepare.template;
     return [
       `auto-ai 执行标识：${run.id}`,
       `候选：${candidate.id}`,
@@ -2667,14 +2665,14 @@ export class Runtime {
       '',
       '## 证据',
       ...(evidenceLines.length > 0 ? evidenceLines : ['- 无']),
-      ...(candidate.pinnedTemplate?.id === SOP_TEMPLATE_ID
+      ...(pin?.id === SOP_TEMPLATE_ID
         ? [
             '',
             '## SOP',
-            `- SOP：${candidate.pinnedTemplate.id}@${candidate.pinnedTemplate.version}`,
+            `- SOP：${pin.id}@${pin.version}`,
             `- 任务稿：${candidate.id}@${run.draftRev}`,
-            `- 计划：${candidate.pinnedTemplate.sopRef}`,
-            `- 验收项：${candidate.draft.acceptance.join('；')}`,
+            `- 计划：${pin.sopRef}`,
+            ...control.sop.task.acceptance.map((item, index) => `- 验收项 ${index + 1}：${item}`),
           ]
         : []),
       '',
@@ -2709,7 +2707,6 @@ export class Runtime {
       return;
     }
     if (isSopRun(run)) {
-      // Lane worktrees are reclaimed now that the parent PR head is recorded.
       // Per-lane failures are recorded and never block the parent archive below.
       try {
         const lanes = await archiveDevelopmentSop({

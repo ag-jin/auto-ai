@@ -112,8 +112,8 @@ class FakeGitHub {
     if (!found) throw new Error(`fake Issue ${repo}#${number} 不存在`);
     return { ...found };
   }
-  async createPullRequest({ repo, worktreePath }) {
-    this.createCalls.push({ repo });
+  async createPullRequest({ repo, worktreePath, body }) {
+    this.createCalls.push({ repo, body });
     const number = this.prs.size + 1;
     const pr = {
       repo, number, url: `https://example.invalid/${repo}/pull/${number}`,
@@ -175,10 +175,15 @@ const CHECKS = [
   { lane: 'develop-b', args: ['tools/check-b.mjs'] },
 ];
 const CONTEXT = YAML.stringify({ sop: SOP, lanes: LANES, checks: CHECKS });
+const ACCEPTANCE = ['返工后 src/subtotal.mjs 导出 reworked', 'src/fee.mjs 导出 stable'];
+const REVIEW_ACCEPTANCE = [
+  '验收项 1：最终 diff 中 src/subtotal.mjs 为 reworked，tools/check-a.mjs 退出码 0',
+  '验收项 2：最终 diff 中 src/fee.mjs 为 stable，tools/check-b.mjs 退出码 0',
+];
 function sopDraft(overrides = {}) {
   return {
     templateId: 'development-sop', goal: '并行实现 subtotal 与 fee', scope: 'src/',
-    acceptance: ['返工后 src/subtotal.mjs 导出 reworked', 'src/fee.mjs 导出 stable'],
+    acceptance: ACCEPTANCE,
     context: CONTEXT, pendingDecisions: [], writeScopes: [LANE_A, LANE_B],
     dependsOn: [], priority: 0, ...overrides,
   };
@@ -186,8 +191,12 @@ function sopDraft(overrides = {}) {
 function handoff(step, artifact, draftRev, overrides = {}) {
   return YAML.stringify({ sop: SOP, template: HANDOFF, draft_rev: draftRev, step, artifact, ...overrides });
 }
-function review(draftRev, overrides) {
-  return YAML.stringify({ sop: SOP, template: REVIEW, draft_rev: draftRev, ...overrides });
+function review(draftRev, { omitAcceptance = false, ...overrides } = {}) {
+  const value = { sop: SOP, template: REVIEW, draft_rev: draftRev, ...overrides };
+  if (value.outcome === 'approved' && !omitAcceptance && !('acceptance' in value)) {
+    value.acceptance = REVIEW_ACCEPTANCE;
+  }
+  return YAML.stringify(value);
 }
 function laneCalls(pi, runId, lane) { return pi.startCalls.filter((c) => c.id.startsWith(`${runId}-${lane}-`)); }
 function reviewCalls(pi, draftTaskId) {
@@ -245,6 +254,9 @@ test('development-sop 检查失败只退 A，返工后独立验收并只交一�
     await writeLaneFile(a1, LANE_A, "export const SUBTOTAL_MARKER = 'initial';\n");
     await writeLaneFile(b1, LANE_B, "export const FEE_MARKER = 'stable';\n");
     pi.complete(a1.id, handoff('develop-a', LANE_A, draftRev));
+    await ticks(runtime);
+    assert.equal(existsSync(path.join(run.worktreePath, LANE_A)), false, '单 lane 完成不得写入父树');
+    assert.equal(existsSync(path.join(run.worktreePath, LANE_B)), false, '单 lane 完成不得写入父树');
     pi.complete(b1.id, handoff('develop-b', LANE_B, draftRev));
     await ticks(runtime);
     const aCalls = laneCalls(pi, run.id, 'develop-a');
@@ -272,6 +284,14 @@ test('development-sop 检查失败只退 A，返工后独立验收并只交一�
     assert.equal(github.mergeCalls.length, 0);
     assert.equal(finished.draftRev, draftRev);
     assert.equal(finished.templateRef, run.templateRef);
+    const body = github.createCalls[0].body;
+    assert.match(body, /## SOP/);
+    assert.ok(body.includes(`- 计划：${appCommit}:templates/development-sop/1.0.0.yaml`), body);
+    for (const item of ACCEPTANCE) assert.ok(body.includes(item), body);
+    assert.ok(finished.result.evidence.some(
+      (item) => item.command === 'development-sop acceptance 1' &&
+        item.detail.includes(ACCEPTANCE[0]) && item.detail.includes(REVIEW_ACCEPTANCE[0]),
+    ));
     const head = finished.result.pr.headSha;
     const paths = (await git(remoteDir, ['diff', '--name-only', `main...${head}`]))
       .split('\n').filter(Boolean).sort();
@@ -386,6 +406,59 @@ test('development-sop 坏交接不能推进', async (t) => {
     assert.ok(blocked.blockedReason);
     assert.equal(github.createCalls.length, 0);
     assert.equal(reviewCalls(pi, draftCall.id).length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('development-sop approved 缺少 acceptance 不交 PR', async (t) => {
+  const h = await makeHarness(t);
+  const { runtime, github, pi } = h;
+  try {
+    const { draftCall, draftRev, run } = await startSop(h);
+    const [a1] = laneCalls(pi, run.id, 'develop-a');
+    const [b1] = laneCalls(pi, run.id, 'develop-b');
+    await writeLaneFile(a1, LANE_A, "export const SUBTOTAL_MARKER = 'reworked';\n");
+    await writeLaneFile(b1, LANE_B, "export const FEE_MARKER = 'stable';\n");
+    pi.complete(a1.id, handoff('develop-a', LANE_A, draftRev));
+    pi.complete(b1.id, handoff('develop-b', LANE_B, draftRev));
+    await ticks(runtime);
+    const [reviewer] = reviewCalls(pi, draftCall.id);
+    pi.complete(reviewer.id, review(draftRev, {
+      outcome: 'approved', reason: '两项均满足', omitAcceptance: true,
+    }));
+    await ticks(runtime);
+    const blocked = (await runtime.getState()).runs[0];
+    assert.equal(blocked.status, 'blocked');
+    assert.match(blocked.blockedReason, /acceptance/);
+    assert.equal(reviewCalls(pi, draftCall.id).length, 1, '坏评审结果不得自动重试');
+    assert.equal(github.createCalls.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('development-sop approved acceptance 条数不符不交 PR', async (t) => {
+  const h = await makeHarness(t);
+  const { runtime, github, pi } = h;
+  try {
+    const { draftCall, draftRev, run } = await startSop(h);
+    const [a1] = laneCalls(pi, run.id, 'develop-a');
+    const [b1] = laneCalls(pi, run.id, 'develop-b');
+    await writeLaneFile(a1, LANE_A, "export const SUBTOTAL_MARKER = 'reworked';\n");
+    await writeLaneFile(b1, LANE_B, "export const FEE_MARKER = 'stable';\n");
+    pi.complete(a1.id, handoff('develop-a', LANE_A, draftRev));
+    pi.complete(b1.id, handoff('develop-b', LANE_B, draftRev));
+    await ticks(runtime);
+    const [reviewer] = reviewCalls(pi, draftCall.id);
+    pi.complete(reviewer.id, review(draftRev, {
+      outcome: 'approved', reason: '两项均满足', acceptance: ['只覆盖第一项'],
+    }));
+    await ticks(runtime);
+    const blocked = (await runtime.getState()).runs[0];
+    assert.equal(blocked.status, 'blocked');
+    assert.match(blocked.blockedReason, /acceptance/);
+    assert.equal(github.createCalls.length, 0);
   } finally {
     await runtime.close();
   }

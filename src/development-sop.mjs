@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parse as parseYaml } from 'yaml';
@@ -11,7 +11,7 @@ export const REVIEW_RESULT_TEMPLATE = 'review-result@1.0.0';
 
 const LANE_IDS = ['develop-a', 'develop-b'];
 const LANE_KEYS = ['sop', 'template', 'draft_rev', 'step', 'artifact'];
-const REVIEW_KEYS = ['sop', 'template', 'draft_rev', 'outcome', 'step', 'reason'];
+const REVIEW_KEYS = ['sop', 'template', 'draft_rev', 'outcome', 'step', 'reason', 'acceptance'];
 const ACTIVE = ['starting', 'started', 'running', 'unknown'];
 const TERMINAL = ['completed', 'failed', 'cancelled'];
 const CHECK_TIMEOUT_MS = 300_000;
@@ -179,6 +179,20 @@ class DevelopmentSop {
       if (lane.status !== 'validated') pending = true;
     }
     if (pending) return { state: 'pending' };
+    try {
+      for (const id of this.#state.task.order) {
+        const lane = this.#state.lanes[id];
+        const content = await readFile(path.join(lane.worktreePath, lane.path));
+        if (sha256(content) !== lane.hash) throw new Error(`lane ${id} 的 ${lane.path} 与校验哈希不一致`);
+        const target = path.join(this.#worktree, lane.path);
+        await mkdir(path.dirname(target), { recursive: true });
+        const existing = await lstat(target).catch(() => null);
+        if (existing && (existing.isSymbolicLink() || !existing.isFile())) throw new Error(`父集成树的 ${lane.path} 不是普通文件`);
+        await writeFile(target, content);
+      }
+    } catch (error) {
+      return await this.#hold(`汇总两路 lane 产物失败：${msg(error)}`);
+    }
     this.#state.status = 'checks';
     await this.#save();
     return 'next';
@@ -238,13 +252,7 @@ class DevelopmentSop {
       const source = path.join(lane.worktreePath, lane.path);
       const stat = await lstat(source);
       if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`lane ${lane.id} 的 ${lane.path} 不是普通文件`);
-      const content = await readFile(source);
-      const target = path.join(this.#worktree, lane.path);
-      await mkdir(path.dirname(target), { recursive: true });
-      const existing = await lstat(target).catch(() => null);
-      if (existing && (existing.isSymbolicLink() || !existing.isFile())) throw new Error(`父集成树的 ${lane.path} 不是普通文件`);
-      await writeFile(target, content);
-      lane.hash = sha256(content);
+      lane.hash = sha256(await readFile(source));
     } catch (error) {
       return await this.#rework(lane.id, 'handoff', msg(error));
     }
@@ -372,13 +380,23 @@ ${state.task.context}
       if (outcome === 'changes_requested' && !state.task.order.includes(value.step)) throw new Error(`review.step 必须是 ${state.task.order.join(' / ')} 之一`);
       const reason = String(value.reason ?? '').trim();
       if (!reason) throw new Error('review.reason 不能为空');
-      verdict = { outcome, reason, step: value.step };
+      let acceptance;
+      if (outcome === 'approved') {
+        if (!Array.isArray(value.acceptance) || value.acceptance.length !== state.task.acceptance.length) {
+          throw new Error(`review.acceptance 必须是与批准稿验收项等长的数组（${state.task.acceptance.length} 项）`);
+        }
+        acceptance = value.acceptance.map((item, index) => {
+          if (typeof item !== 'string' || !item.trim()) throw new Error(`review.acceptance[${index}] 必须是非空字符串`);
+          return item.trim();
+        });
+      }
+      verdict = { outcome, reason, step: value.step, acceptance };
     } catch (error) {
       return await this.#block(`独立评审结果无效：${msg(error)}`);
     }
     if (verdict.outcome === 'approved') {
       if ((await this.#integrationTree()) !== state.testedTree) return await this.#hold('父工作树产物在评审期间发生变化，评审结论不再对应当前产物');
-      return await this.#finish(verdict.reason);
+      return await this.#finish(verdict.reason, verdict.acceptance);
     }
     state.review = null;
     return await this.#rework(verdict.step, 'review', verdict.reason);
@@ -393,7 +411,8 @@ ${state.task.context}
     return `你是双路开发 SOP（${DEVELOPMENT_SOP_ID}）的独立代码评审者，只读、无工具。只依据批准稿、最终 diff 和真实检查证据判断。
 ## 已批准任务稿（只读）
 - 目标：${state.task.goal}
-- 验收（自然语言原文，判断依据）：${state.task.acceptance.join('\n')}
+- 验收（自然语言原文，判断依据）：
+${state.task.acceptance.map((item, index) => `${index + 1}. ${item}`).join('\n')}
 - draft_rev：${state.task.draftRev}
 \`\`\`yaml
 ${state.task.context}
@@ -404,7 +423,7 @@ ${diff.trimEnd()}
 \`\`\`
 ## 检查证据（父集成工作树真实执行）
 ${evidence}
-## 输出要求：只输出一个 YAML 映射。通过：sop: ${DEVELOPMENT_SOP_ID} / template: ${state.plan.review} / draft_rev: ${state.task.draftRev} / outcome: approved / reason。返工：同上，outcome: changes_requested，并给出 step: ${state.task.order.join(' 或 ')} 与具体 reason。`;
+## 输出要求：只输出一个 YAML 映射。通过：sop: ${DEVELOPMENT_SOP_ID} / template: ${state.plan.review} / draft_rev: ${state.task.draftRev} / outcome: approved / reason / acceptance。acceptance 必须是与批准稿验收项等长、同序的字符串数组，逐项引用最终 diff 或检查证据说明该项如何满足，不得合并、省略或留空。返工：同上，outcome: changes_requested，并给出 step: ${state.task.order.join(' 或 ')} 与具体 reason。`;
   }
 
   async #integrationTree() {
@@ -421,7 +440,7 @@ ${evidence}
     await this.#git(['--literal-pathspecs', 'add', '--', ...paths]);
     return (await this.#git(['write-tree'])).trim();
   }
-  async #finish(reason) {
+  async #finish(reason, acceptance) {
     if (!(await this.#authorized())) return await this.#block('交付前授权已失效');
     const state = this.#state;
     const evidence = state.task.order.map((id) => ({ command: `development-sop handoff ${id}`, status: 'passed', detail: `${state.lanes[id].path} sha256:${String(state.lanes[id].hash).slice(0, 12)}` }));
@@ -430,6 +449,10 @@ ${evidence}
       command: 'development-sop review', status: 'passed',
       detail: `独立评审 approved（第 ${state.review.round} 轮）${state.reworks.length ? `，返工 ${state.reworks.length} 次` : ''}：${clip(reason, 300)}`,
     });
+    state.task.acceptance.forEach((item, index) => evidence.push({
+      command: `development-sop acceptance ${index + 1}`, status: 'passed', detail: clip(`验收项：${item}\n评审证据：${acceptance[index]}`),
+    }));
+    state.review.acceptance = acceptance;
     const result = {
       summary: `SOP ${DEVELOPMENT_SOP_ID} 两路开发通过：${state.task.order.map((id) => `${id} → ${state.lanes[id].path}`).join('，')}；${state.checksRun.length} 项检查通过；独立评审 approved`,
       artifacts: state.task.order.map((id) => state.lanes[id].path), evidence, blockers: [],
@@ -544,26 +567,10 @@ export async function cancelDevelopmentSop({ run, control, pi, persist } = {}) {
   return stopped ? { state: 'cancelled', stopped: true } : { state: 'unknown', stopped: false };
 }
 
-function gitAt(cwd, args) {
-  return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, ...args], { timeout: 60_000, maxBuffer: 4 << 20 }, (error, out) =>
-      error ? reject(new Error(`git ${args.join(' ')} 失败`)) : resolve(String(out ?? '')),
-    );
-  });
-}
-
-function gitBlob(cwd, sha) {
-  return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, 'cat-file', 'blob', sha], { timeout: 60_000, maxBuffer: 8 << 20 }, (error, out) =>
-      error ? reject(new Error('读取父交付 blob 失败')) : resolve(out),
-    );
-  });
-}
-
 /**
- * After the parent PR was read back, confirm each lane still mirrors the one
- * delivered file, clean that file, then let WorkspaceAdapter archive the lane.
- * Anything unconfirmed is reported, never deleted.
+ * After the parent PR was read back, hand each lane to WorkspaceAdapter, which
+ * verifies manifest ownership and the parent-delivered blob before cleaning the
+ * one delivered file and removing the tree. Anything unconfirmed is reported.
  */
 export async function archiveDevelopmentSop({ control, workspace, repoEntry, run } = {}) {
   const state = control?.sop;
@@ -584,41 +591,11 @@ export async function archiveDevelopmentSop({ control, workspace, repoEntry, run
       continue;
     }
     try {
-      const info = await workspace.inspect({ worktreePath: lane.worktreePath });
-      if (String(info.headSha).toLowerCase() !== String(base).toLowerCase()) {
-        fail(`HEAD ${info.headSha} 不是基线`);
-        continue;
-      }
-      const paths = [...new Set(info.paths ?? [])];
-      if (paths.length !== 1 || paths[0] !== lane.path) {
-        fail(`工作树不是单一交付文件：${paths.join('、') || '无'}`);
-        continue;
-      }
-      const file = path.join(lane.worktreePath, lane.path);
-      const stat = await lstat(file);
-      if (stat.isSymbolicLink() || !stat.isFile()) {
-        fail('交付文件不是普通文件');
-        continue;
-      }
-      if (sha256(await readFile(file)) !== lane.hash) {
-        fail('lane 文件与记录哈希不一致');
-        continue;
-      }
-      const blob = await gitAt(parent, ['rev-parse', `${head}:${lane.path}`]);
-      if (sha256(await gitBlob(parent, blob.trim())) !== lane.hash) {
-        fail('父交付 commit 的 blob 与 lane 产物不一致');
-        continue;
-      }
-      const atBase = await gitAt(lane.worktreePath, ['cat-file', '-e', `${base}:${lane.path}`]).then(() => true, () => false);
-      if (atBase) {
-        await gitAt(lane.worktreePath, ['restore', '--staged', '--worktree', '--', lane.path]);
-      } else {
-        await gitAt(lane.worktreePath, ['rm', '--cached', '-f', '--', lane.path]).catch(() => {});
-        await unlink(file);
-      }
       const archived = await workspace.archiveLane({
         repo: run.repo, localPath: repoEntry.localPath, worktreePath: lane.worktreePath,
         runId: `${run.id}-${lane.id}`, baseCommit: base,
+        deliveredFile: lane.path, deliveredHash: lane.hash,
+        parentPath: parent, parentHead: head,
       });
       if (archived?.removed) records.push({ step: id, removed: true });
       else records.push({ step: id, removed: false, reason: archived?.reason ?? '未回收' });

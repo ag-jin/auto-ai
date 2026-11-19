@@ -2174,6 +2174,7 @@ function renderCandidateProgress(candidate) {
               run.updatedAt ? h("span", {}, fmtTime(run.updatedAt)) : null,
               run.templateRef ? h("span", { class: "mono" }, run.templateRef) : null,
             ),
+            renderSopProgress(run),
           ),
         ),
       ),
@@ -2485,6 +2486,9 @@ function renderRunCard(run, options = {}) {
     }
   }
 
+  const sopProgress = renderSopProgress(run);
+  if (sopProgress) card.append(sopProgress);
+
   if (blocked) {
     if (reasons.length) {
       card.append(
@@ -2695,6 +2699,189 @@ function renderResultCore(result, options = {}) {
       ),
     );
   }
+  return container;
+}
+
+/* ---------------- SOP 执行进度（只读） ---------------- */
+
+const SOP_STATUS_LABELS = {
+  prepare: "准备中",
+  preparing: "准备中",
+  prepared: "已准备",
+  lanes: "双路开发",
+  checks: "检查中",
+  review: "独立评审",
+  passed: "已通过",
+  approved: "已通过",
+  completed: "已完成",
+  validated: "已完成",
+  running: "进行中",
+  pending: "等待",
+  queued: "排队",
+  rework: "返工",
+  failed: "失败",
+  denied: "未授权",
+  held: "已阻塞",
+  hold: "已阻塞",
+  blocked: "已阻塞",
+  changes_requested: "要求修改",
+  stopped: "已停止",
+};
+
+const SOP_STATUS_TONES = {
+  passed: "is-ok",
+  approved: "is-ok",
+  completed: "is-ok",
+  validated: "is-ok",
+  failed: "is-danger",
+  denied: "is-danger",
+  changes_requested: "is-danger",
+  held: "is-warn",
+  hold: "is-warn",
+  blocked: "is-warn",
+  rework: "is-warn",
+  running: "is-accent",
+  lanes: "is-accent",
+  checks: "is-accent",
+  review: "is-accent",
+};
+
+function sopStatusLabel(status) {
+  const value = str(status);
+  if (!value) return "未记录";
+  return SOP_STATUS_LABELS[value] || value;
+}
+
+function sopStatusBadge(status, prefix = "") {
+  const value = str(status);
+  const label = sopStatusLabel(value);
+  const text = value && label !== value ? `${label} ${value}` : label;
+  return badge(`${prefix}${text}`.trim(), SOP_STATUS_TONES[value] || "");
+}
+
+function sopLaneItem(lane) {
+  const feedback = lane.feedback && typeof lane.feedback === "object" ? lane.feedback : null;
+  const hasFeedback = feedback && (str(feedback.stage) || str(feedback.reason));
+  return h(
+    "li",
+    {},
+    sopStatusBadge(lane.status),
+    h("span", { class: "mono" }, `${str(lane.id) || "未命名路"} · ${str(lane.path) || "未记录文件"}`),
+    h("span", {}, `第 ${finiteNumber(lane.attempt, 1)} 次尝试`),
+    h("span", {}, `Pi：${sopStatusLabel(lane.piStatus)}${str(lane.piStatus) && sopStatusLabel(lane.piStatus) !== str(lane.piStatus) ? ` ${str(lane.piStatus)}` : ""}`),
+    hasFeedback
+      ? h(
+          "span",
+          {},
+          `返工阶段：${str(feedback.stage) || "未记录"}；返工原因：${str(feedback.reason) || "未记录"}`,
+        )
+      : null,
+  );
+}
+
+function sopReworkItem(rework) {
+  return h(
+    "li",
+    {},
+    h("span", { class: "mono" }, str(rework.step) || "未记录步骤"),
+    h("span", {}, `阶段：${str(rework.stage) || "未记录"}`),
+    h("span", {}, `原因：${str(rework.reason) || "未记录"}`),
+  );
+}
+
+function sopCheckItem(check) {
+  return h(
+    "li",
+    {},
+    sopStatusBadge(check.status),
+    h("span", { class: "mono" }, str(check.lane) || "未记录路"),
+    h("span", { class: "mono" }, str(check.command) || "未记录命令"),
+    h("span", {}, `详情：${str(check.detail) || "未记录"}`),
+  );
+}
+
+/**
+ * 只读渲染 Run 上的 SOP 摘要（getState().runs[].sop 白名单投影）。
+ * 旧 Run 没有 sop 时返回 null，避免空面板；所有记录只作为文本节点输出。
+ * 最终 PR 链接仍由 renderResultCore / externalLink 负责，不在此重复。
+ */
+function renderSopProgress(run) {
+  const sop = run && typeof run === "object" ? run.sop : null;
+  if (!sop || typeof sop !== "object") return null;
+
+  const lanes = Array.isArray(sop.lanes)
+    ? sop.lanes.filter((lane) => lane && typeof lane === "object")
+    : [];
+  const reworks = Array.isArray(sop.reworks)
+    ? sop.reworks.filter((rework) => rework && typeof rework === "object")
+    : [];
+  const checks = Array.isArray(sop.checks)
+    ? sop.checks.filter((check) => check && typeof check === "object")
+    : [];
+  const review = sop.review && typeof sop.review === "object" ? sop.review : null;
+  const acceptance =
+    review && Array.isArray(review.acceptance)
+      ? review.acceptance.filter((item) => item !== null && item !== undefined)
+      : [];
+
+  const container = h("div", { class: "sop-progress" });
+  container.append(
+    h(
+      "div",
+      { class: "section-head" },
+      h("h4", {}, "SOP 双路执行进度"),
+      sopStatusBadge(sop.status),
+    ),
+    h("p", { class: "section-sub" }, "只读展示已有 SOP 控制记录；不触发派发、审批、返工或合并。"),
+  );
+
+  if (lanes.length) {
+    container.append(
+      h("p", { class: "field-label" }, `两路开发 · ${lanes.length}`),
+      h("ul", { class: "reason-list" }, ...lanes.map((lane) => sopLaneItem(lane))),
+    );
+  } else {
+    container.append(h("p", { class: "hint" }, "SOP 记录尚未写入开发路。"));
+  }
+
+  if (reworks.length) {
+    container.append(
+      h("p", { class: "field-label" }, `返工记录 · ${reworks.length}`),
+      h("ul", { class: "reason-list" }, ...reworks.map((rework) => sopReworkItem(rework))),
+    );
+  }
+
+  if (checks.length) {
+    container.append(
+      h("p", { class: "field-label" }, `实际检查 · ${checks.length}`),
+      h("ul", { class: "reason-list" }, ...checks.map((check) => sopCheckItem(check))),
+    );
+  }
+
+  if (review) {
+    container.append(
+      h("p", { class: "field-label" }, "独立代码评审"),
+      h(
+        "p",
+        { class: "run-meta" },
+        sopStatusBadge(review.status, "评审 "),
+        h("span", {}, `第 ${finiteNumber(review.round, 1)} 轮`),
+        acceptance.length ? null : h("span", { class: "muted" }, "验收证据未生成"),
+      ),
+      acceptance.length
+        ? h(
+            "ul",
+            { class: "reason-list" },
+            ...acceptance.map((item, index) => h("li", {}, `验收 ${index + 1}：${str(item)}`)),
+          )
+        : null,
+    );
+  }
+
+  if (sop.holdReason) {
+    container.append(h("p", { class: "hint" }, `阻塞原因：${str(sop.holdReason)}`));
+  }
+
   return container;
 }
 

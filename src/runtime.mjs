@@ -503,6 +503,7 @@ export class Runtime {
         result: run.result,
         blockedReason: run.blockedReason,
         holdReason: control?.hold?.reason ?? null,
+        sop: this.#sopDto(control),
         createdAt: run.createdAt,
         updatedAt: run.updatedAt,
       };
@@ -520,6 +521,73 @@ export class Runtime {
       templateListError: templateList.templateListError,
       runtime: this.#runtimeDto(this.#activeDraftIds()),
       capabilities: await this.#capabilities(),
+    };
+  }
+
+  // Read-only whitelist projection of a Run's SOP control. Never exposes the
+  // approved task, prompts, credentials or internal worktree paths, and never
+  // writes the control or workflow facts.
+  #sopDto(control) {
+    const sop = control?.sop;
+    if (!isObject(sop)) {
+      return null;
+    }
+    const text = (value) => (typeof value === 'string' && value.length > 0 ? value : null);
+    const feedbackDto = (feedback) => {
+      if (!isObject(feedback)) {
+        return null;
+      }
+      return { stage: text(feedback.stage), reason: text(feedback.reason) };
+    };
+    const sourceLanes = isObject(sop.lanes) ? sop.lanes : {};
+    const order = Array.isArray(sop.task?.order)
+      ? sop.task.order.filter((id) => typeof id === 'string')
+      : Object.keys(sourceLanes);
+    const lanes = [];
+    const seen = new Set();
+    for (const id of order) {
+      const lane = sourceLanes[id];
+      if (!isObject(lane) || seen.has(id)) {
+        continue;
+      }
+      seen.add(id);
+      lanes.push({
+        id: text(lane.id) ?? id,
+        path: text(lane.path),
+        status: text(lane.status),
+        attempt: Number.isInteger(lane.attempt) ? lane.attempt : null,
+        piStatus: text(lane.piStatus),
+        feedback: feedbackDto(lane.feedback),
+      });
+    }
+    const reworks = (Array.isArray(sop.reworks) ? sop.reworks : [])
+      .filter(isObject)
+      .map((item) => ({ step: text(item.step), stage: text(item.stage), reason: text(item.reason) }));
+    const checks = (Array.isArray(sop.checksRun) ? sop.checksRun : [])
+      .filter(isObject)
+      .map((item) => ({
+        lane: text(item.lane),
+        command: text(item.command),
+        status: text(item.status),
+        detail: text(item.detail),
+      }));
+    const reviewSource = isObject(sop.review) ? sop.review : null;
+    const review = reviewSource === null
+      ? null
+      : {
+        round: Number.isInteger(reviewSource.round) ? reviewSource.round : null,
+        status: isObject(sop.result) ? 'approved' : text(reviewSource.piStatus),
+        acceptance: Array.isArray(reviewSource.acceptance)
+          ? reviewSource.acceptance.filter((item) => typeof item === 'string')
+          : null,
+      };
+    return {
+      status: text(sop.status),
+      lanes,
+      reworks,
+      checks,
+      review,
+      holdReason: text(sop.hold?.reason) ?? text(control?.hold?.reason),
     };
   }
 

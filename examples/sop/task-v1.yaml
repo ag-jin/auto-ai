@@ -1,0 +1,13 @@
+task: AC-01
+version: 1
+sop: development@1.0.0
+goal: Demonstrate delivery from an approved task draft through parallel development, testing, code review, and one pull request.
+scope: examples/sop/
+acceptance:
+  unit_cents: 1200
+  quantity: 2
+  subtotal_cents: 2400
+  total_cents: 2640
+checks:
+  - node examples/sop/check.mjs
+  - npm test

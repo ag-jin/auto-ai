@@ -1,0 +1,5 @@
+sop: development@1.0.0
+template: development-result@1.0.0
+task: AC-01@1
+step: develop-b
+artifact: fee.mjs

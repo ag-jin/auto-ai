@@ -132,6 +132,48 @@ if (MODE !== 'frontend') {
     assert.deepEqual({ runs: reopened.listRuns(), candidates: reopened.listCandidates() }, snapshot, 'getState 不得改变 workflow 事实');
     reopened.close();
   });
+
+  test('run.sop 只替换已知工作树与本 run 路径前缀，保留相对脚本和原始断言', async (t) => {
+    const dataDir = await tempDir(t, 'sop-redact-');
+    const { sopRun } = await seedRuns(dataDir);
+    const parent = path.join(dataDir, 'workspace', 'worktrees', 'ag-jin-auto-ai-1');
+    const laneA = `${parent}-develop-a`;
+    const laneB = `${parent}-develop-b`;
+    const runDir = path.join(dataDir, 'runs', sopRun.id);
+    const resultPath = path.join(runDir, 'result.json');
+    const control = sopControl(sopRun.id);
+    control.prepare.worktreePath = parent;
+    control.prepare.resultPath = resultPath;
+    control.sop.lanes['develop-a'].worktreePath = laneA;
+    control.sop.lanes['develop-b'].worktreePath = laneB;
+    control.sop.lanes['develop-a'].feedback.reason = `file://${laneA}/examples/check-a.mjs 断言失败：预期 1 得到 2`;
+    control.sop.reworks = [{ step: 'develop-a', stage: 'review', reason: `冲突文件 ${laneB}/src/b.mjs` }];
+    control.sop.checksRun = [{ lane: 'develop-a', command: 'node scripts/check-a.mjs', status: 'failed', detail: `运行于 ${parent}：node:internal/modules 断言失败` }];
+    control.sop.review = { round: 2, piStatus: 'completed', acceptance: [`${laneA}/examples/demo.mjs 未生成`] };
+    control.sop.hold = { reason: `无法读取 ${resultPath}` };
+    const controlFile = await writeControl(dataDir, sopRun.id, control);
+    const controlBefore = await readFile(controlFile, 'utf8');
+
+    const runtime = new Runtime({ dataDir, appRepoDir: APP_REPO, tickMs: 10, workspace: {}, github: { checkReady: async () => ({ ready: true }) },
+      pi: { start() { throw new Error('getState 不得调用 pi.start'); } } });
+    const state = await runtime.getState();
+    const sop = findSop(state, sopRun.id);
+
+    assert.equal(sop.lanes[0].feedback.reason, 'file://<worktree>/examples/check-a.mjs 断言失败：预期 1 得到 2');
+    assert.equal(sop.reworks[0].reason, '冲突文件 <worktree>/src/b.mjs');
+    assert.equal(sop.checks[0].detail, '运行于 <worktree>：node:internal/modules 断言失败');
+    assert.deepEqual(sop.review.acceptance, ['<worktree>/examples/demo.mjs 未生成']);
+    assert.equal(sop.holdReason, '无法读取 <run>/result.json');
+    assert.ok(sop.checks[0].command.includes('scripts/check-a.mjs'), '命令中的相对脚本路径必须保留');
+    assert.ok(sop.reworks[0].reason.includes('src/b.mjs'), '已知前缀后的相对路径必须保留');
+    assert.ok(sop.reworks[0].reason.includes('冲突文件'), '原始断言文本必须保留');
+    const serialized = JSON.stringify(sop);
+    for (const leak of [dataDir, parent, laneA, laneB]) {
+      assert.ok(!serialized.includes(leak), `run.sop 不得泄露内部路径 ${leak}`);
+    }
+    assert.equal(await readFile(controlFile, 'utf8'), controlBefore, '脱敏只作用于投影，不得改写 control');
+    await runtime.close();
+  });
 }
 
 // Frontend: renderSopProgress(run) in public/app.js

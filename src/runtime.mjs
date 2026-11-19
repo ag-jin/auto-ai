@@ -532,14 +532,53 @@ export class Runtime {
     if (!isObject(sop)) {
       return null;
     }
-    const text = (value) => (typeof value === 'string' && value.length > 0 ? value : null);
+    const sourceLanes = isObject(sop.lanes) ? sop.lanes : {};
+    const prepare = isObject(control?.prepare) ? control.prepare : {};
+    const prefixes = [];
+    const known = (value, replacement) => {
+      if (typeof value === 'string' && value.length > 1) {
+        prefixes.push([value.replace(/\/+$/, ''), replacement]);
+      }
+    };
+    known(prepare.worktreePath, '<worktree>');
+    for (const lane of Object.values(sourceLanes)) {
+      if (isObject(lane)) {
+        known(lane.worktreePath, '<worktree>');
+      }
+    }
+    if (typeof prepare.resultPath === 'string') {
+      known(path.dirname(prepare.resultPath), '<run>');
+    }
+    prefixes.sort((a, b) => b[0].length - a[0].length);
+    const replacePrefix = (value, prefix, replacement) => {
+      let output = '';
+      let from = 0;
+      for (;;) {
+        const at = value.indexOf(prefix, from);
+        if (at === -1) {
+          return output + value.slice(from);
+        }
+        const end = at + prefix.length;
+        const next = value[end];
+        if (next === undefined || !/[A-Za-z0-9_-]/.test(next)) {
+          output += value.slice(from, at) + replacement;
+        } else {
+          output += value.slice(from, end);
+        }
+        from = end;
+      }
+    };
+    const redact = (value) => prefixes.reduce(
+      (result, [prefix, replacement]) => replacePrefix(result, prefix, replacement),
+      value,
+    );
+    const text = (value) => (typeof value === 'string' && value.length > 0 ? redact(value) : null);
     const feedbackDto = (feedback) => {
       if (!isObject(feedback)) {
         return null;
       }
       return { stage: text(feedback.stage), reason: text(feedback.reason) };
     };
-    const sourceLanes = isObject(sop.lanes) ? sop.lanes : {};
     const order = Array.isArray(sop.task?.order)
       ? sop.task.order.filter((id) => typeof id === 'string')
       : Object.keys(sourceLanes);
@@ -578,7 +617,7 @@ export class Runtime {
         round: Number.isInteger(reviewSource.round) ? reviewSource.round : null,
         status: isObject(sop.result) ? 'approved' : text(reviewSource.piStatus),
         acceptance: Array.isArray(reviewSource.acceptance)
-          ? reviewSource.acceptance.filter((item) => typeof item === 'string')
+          ? reviewSource.acceptance.filter((item) => typeof item === 'string').map(redact)
           : null,
       };
     return {
